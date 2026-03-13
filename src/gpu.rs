@@ -1,5 +1,5 @@
 //! GPU inference backend using wgpu compute shaders.
-//! Compiled only with `--features gpu`.
+//! Compiled when the `gpu` feature is enabled (on by default).
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
