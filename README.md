@@ -1,6 +1,6 @@
 # nanoimg
 
-Semantic image search. ~2200 lines of Rust.
+Semantic image search. ~2500 lines of Rust (+1400 optional GPU).
 
 Point at a folder of images, ask a question in plain English.
 
@@ -17,13 +17,15 @@ Everything that matters is from scratch:
 
 | Component | ~lines | Replaces |
 |---|---|---|
-| ONNX runtime (21 ops) | 1000 | onnxruntime, tract |
+| ONNX runtime (21 ops) | 1100 | onnxruntime, tract |
+| GPU backend (11 WGSL shaders) | 1400 | cuDNN, wonnx |
 | Protobuf parser | 100 | prost, protobuf |
 | BPE tokenizer | 300 | tokenizers + serde_json |
 | Flat-file database | 150 | rusqlite |
 
 [usearch](https://github.com/unum-cloud/usearch) handles HNSW.
-BLAS handles matmul. Everything else is hand-rolled.
+BLAS handles matmul. GPU backend uses wgpu compute shaders.
+Everything else is hand-rolled.
 
 ## How it works
 
@@ -39,14 +41,18 @@ Linux x86_64 + OpenBLAS:
 dnf install openblas-devel    # Fedora/RHEL
 apt install libopenblas-dev   # Debian/Ubuntu
 
-cargo build --release
+cargo build --release                   # CPU only
+cargo build --release --features gpu    # CPU + GPU (Vulkan/Metal/DX12 via wgpu)
 ```
+
+GPU auto-detects at runtime. Falls back to CPU if no GPU found.
 
 ## Test
 
 ```
 cargo test                              # unit tests (db, vector store)
 cargo test -- --ignored                 # integration tests (downloads models + images)
+cargo test --features gpu -- --ignored  # GPU correctness + benchmarks
 ```
 
 ## Data

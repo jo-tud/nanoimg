@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::shape::*;
+
 // ── BLAS FFI ─────────────────────────────────────────────────────────────────
 
 const ROW_MAJOR: i32 = 101;
@@ -84,13 +86,13 @@ pub enum AttrVal {
 }
 
 impl Node {
-    fn attr_i(&self, name: &str) -> Option<i64> {
+    pub fn attr_i(&self, name: &str) -> Option<i64> {
         match self.attrs.get(name)? { AttrVal::I(v) => Some(*v), _ => None }
     }
-    fn attr_ints(&self, name: &str) -> Option<&[i64]> {
+    pub fn attr_ints(&self, name: &str) -> Option<&[i64]> {
         match self.attrs.get(name)? { AttrVal::Ints(v) => Some(v), _ => None }
     }
-    fn attr_f(&self, name: &str) -> Option<f32> {
+    pub fn attr_f(&self, name: &str) -> Option<f32> {
         match self.attrs.get(name)? { AttrVal::F(v) => Some(*v), _ => None }
     }
 }
@@ -366,72 +368,6 @@ impl OnnxModel {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-fn compute_strides(shape: &[usize]) -> Vec<usize> {
-    let n = shape.len();
-    if n == 0 { return vec![1]; }
-    let mut s = vec![1usize; n];
-    for i in (0..n - 1).rev() {
-        s[i] = s[i + 1] * shape[i + 1];
-    }
-    s
-}
-
-fn broadcast_shape(a: &[usize], b: &[usize]) -> Vec<usize> {
-    let n = a.len().max(b.len());
-    let mut out = vec![0; n];
-    for i in 0..n {
-        let da = if i < n - a.len() { 1 } else { a[i - (n - a.len())] };
-        let db = if i < n - b.len() { 1 } else { b[i - (n - b.len())] };
-        assert!(da == db || da == 1 || db == 1,
-            "broadcast: incompatible dims {} vs {}", da, db);
-        out[i] = da.max(db);
-    }
-    out
-}
-
-/// Compute strides for an input tensor broadcast to `out_shape`.
-/// Dimensions of size 1 get stride 0 (repeated).
-fn broadcast_strides(in_shape: &[usize], out_shape: &[usize]) -> Vec<usize> {
-    let n = out_shape.len();
-    let in_n = in_shape.len();
-    let off = n - in_n;
-    let in_s = compute_strides(in_shape);
-    let mut result = vec![0usize; n];
-    for d in 0..n {
-        if d >= off && in_shape[d - off] != 1 {
-            result[d] = in_s[d - off];
-        }
-    }
-    result
-}
-
-fn normalize_axis(axis: i64, ndim: usize) -> usize {
-    if axis < 0 { (ndim as i64 + axis) as usize } else { axis as usize }
-}
-
-fn broadcast_batch_idx(flat: usize, out_batch: &[usize], in_batch: &[usize]) -> usize {
-    let n = out_batch.len();
-    let in_n = in_batch.len();
-    if in_n == 0 { return 0; }
-    let off = n - in_n;
-    let mut result = 0;
-    let mut remaining = flat;
-    let mut stride = 1;
-    for d in (0..n).rev() {
-        let coord = remaining % out_batch[d];
-        remaining /= out_batch[d];
-        if d >= off {
-            let id = d - off;
-            let c = if in_batch[id] == 1 { 0 } else { coord };
-            result += c * stride;
-            stride *= in_batch[id];
-        }
-    }
-    result
-}
-
 // ── Operators ────────────────────────────────────────────────────────────────
 
 fn binary_op(a: &Tensor, b: &Tensor, f: fn(f32, f32) -> f32) -> Tensor {
@@ -537,43 +473,7 @@ fn op_gemm(a: &Tensor, b: &Tensor, c: Option<&Tensor>, node: &Node) -> Tensor {
     let trans_b = node.attr_i("transB").unwrap_or(0) != 0;
     let alpha = node.attr_f("alpha").unwrap_or(1.0);
     let beta = node.attr_f("beta").unwrap_or(1.0);
-
-    let (m, k_a) = if trans_a { (a.shape[1], a.shape[0]) } else { (a.shape[0], a.shape[1]) };
-    let (k_b, n) = if trans_b { (b.shape[1], b.shape[0]) } else { (b.shape[0], b.shape[1]) };
-    assert_eq!(k_a, k_b, "gemm: inner dims mismatch");
-
-    let ad = a.as_f32();
-    let bd = b.as_f32();
-    let mut out = vec![0f32; m * n];
-
-    // Initialize with bias if present
-    if let Some(bias) = c {
-        let bdata = bias.as_f32();
-        if bdata.len() == n {
-            for i in 0..m {
-                out[i * n..(i + 1) * n].copy_from_slice(bdata);
-            }
-        } else {
-            out[..bdata.len().min(m * n)].copy_from_slice(&bdata[..bdata.len().min(m * n)]);
-        }
-    }
-
-    let lda = if trans_a { m } else { k_a };
-    let ldb = if trans_b { k_b } else { n };
-
-    unsafe {
-        cblas_sgemm(
-            ROW_MAJOR,
-            if trans_a { TRANS } else { NO_TRANS },
-            if trans_b { TRANS } else { NO_TRANS },
-            m as i32, n as i32, k_a as i32,
-            alpha, ad.as_ptr(), lda as i32,
-            bd.as_ptr(), ldb as i32,
-            beta, out.as_mut_ptr(), n as i32,
-        );
-    }
-
-    Tensor::f32(vec![m, n], out)
+    cpu_gemm(a, b, c, trans_a, trans_b, alpha, beta)
 }
 
 fn op_conv(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>, node: &Node) -> Tensor {
@@ -1090,4 +990,75 @@ fn exec_node(
 
     let out_name = &node.outputs[0];
     Ok(vec![(out_name.clone(), result)])
+}
+
+// ── Public helpers for GPU fallback ──────────────────────────────────────────
+
+pub fn cpu_gemm(a: &Tensor, b: &Tensor, c: Option<&Tensor>,
+                trans_a: bool, trans_b: bool, alpha: f32, beta: f32) -> Tensor {
+    let (m, k_a) = if trans_a { (a.shape[1], a.shape[0]) } else { (a.shape[0], a.shape[1]) };
+    let (k_b, n) = if trans_b { (b.shape[1], b.shape[0]) } else { (b.shape[0], b.shape[1]) };
+    assert_eq!(k_a, k_b, "gemm: inner dims mismatch");
+
+    let ad = a.as_f32();
+    let bd = b.as_f32();
+    let mut out = vec![0f32; m * n];
+    if let Some(bias) = c {
+        let bdata = bias.as_f32();
+        if bdata.len() == n {
+            for i in 0..m { out[i * n..(i + 1) * n].copy_from_slice(bdata); }
+        } else {
+            out[..bdata.len().min(m * n)].copy_from_slice(&bdata[..bdata.len().min(m * n)]);
+        }
+    }
+    let lda = if trans_a { m } else { k_a };
+    let ldb = if trans_b { k_b } else { n };
+    unsafe {
+        cblas_sgemm(
+            ROW_MAJOR,
+            if trans_a { TRANS } else { NO_TRANS },
+            if trans_b { TRANS } else { NO_TRANS },
+            m as i32, n as i32, k_a as i32,
+            alpha, ad.as_ptr(), lda as i32,
+            bd.as_ptr(), ldb as i32,
+            beta, out.as_mut_ptr(), n as i32,
+        );
+    }
+    Tensor::f32(vec![m, n], out)
+}
+
+#[cfg(feature = "gpu")]
+pub fn cpu_reduce_mean(data: &Tensor, axes: &[i64], keepdims: bool) -> Tensor {
+    op_reduce_mean(data, axes, keepdims)
+}
+
+#[cfg(feature = "gpu")]
+pub fn cpu_gather(data: &Tensor, indices: &Tensor, axis: i64) -> Tensor {
+    op_gather(data, indices, axis)
+}
+
+#[cfg(feature = "gpu")]
+pub fn cpu_concat(tensors: &[&Tensor], axis: i64) -> Tensor {
+    op_concat(tensors, axis)
+}
+
+#[cfg(feature = "gpu")]
+pub fn cpu_slice(data: &Tensor, starts: &Tensor, ends: &Tensor,
+                 axes: Option<&Tensor>, steps: Option<&Tensor>) -> Tensor {
+    op_slice(data, starts, ends, axes, steps)
+}
+
+#[cfg(feature = "gpu")]
+pub fn cpu_unsqueeze(data: &Tensor, axes: &Tensor) -> Tensor {
+    op_unsqueeze(data, axes)
+}
+
+#[cfg(feature = "gpu")]
+pub fn cpu_squeeze(data: &Tensor, axes: Option<&Tensor>) -> Tensor {
+    op_squeeze(data, axes)
+}
+
+#[cfg(feature = "gpu")]
+pub fn cpu_reshape(data: &Tensor, shape: &Tensor) -> Tensor {
+    op_reshape(data, shape)
 }

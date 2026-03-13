@@ -6,8 +6,11 @@ use std::path::PathBuf;
 mod backends;
 mod db;
 mod index;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod models;
 mod onnx;
+mod shape;
 mod store;
 mod tokenizer;
 

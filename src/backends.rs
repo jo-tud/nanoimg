@@ -32,13 +32,38 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 pub struct SigLIP2ImageEmbedder {
     model: OnnxModel,
+    #[cfg(feature = "gpu")]
+    gpu: Option<std::sync::Mutex<crate::gpu::GpuExecutor>>,
 }
 
 impl SigLIP2ImageEmbedder {
     pub fn load(model_path: &Path) -> Result<Self> {
         let model = OnnxModel::load(model_path)
             .context("load siglip2 image model")?;
-        Ok(Self { model })
+
+        #[cfg(feature = "gpu")]
+        let gpu = crate::gpu::GpuContext::try_new().map(|ctx| {
+            eprintln!("GPU: {}", ctx.name);
+            std::sync::Mutex::new(crate::gpu::GpuExecutor::new(ctx))
+        });
+        #[cfg(feature = "gpu")]
+        if gpu.is_none() {
+            eprintln!("No GPU detected, using CPU");
+        }
+
+        Ok(Self {
+            model,
+            #[cfg(feature = "gpu")]
+            gpu,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn has_gpu(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        { self.gpu.is_some() }
+        #[cfg(not(feature = "gpu"))]
+        { false }
     }
 
     fn preprocess(img: &DynamicImage) -> Vec<f32> {
@@ -59,6 +84,18 @@ impl Embedder for SigLIP2ImageEmbedder {
     fn embed(&self, img: &DynamicImage) -> Result<Vec<f32>> {
         let pixel_values = Self::preprocess(img);
         let input = Tensor::f32(vec![1, 3, 224, 224], pixel_values);
+
+        #[cfg(feature = "gpu")]
+        if let Some(ref gpu) = self.gpu {
+            let outputs = gpu.lock().unwrap().run(&self.model, vec![("pixel_values", input)])
+                .context("gpu run image model")?;
+            let pooler = outputs.get("pooler_output")
+                .context("missing pooler_output")?;
+            let mut v = pooler.as_f32().to_vec();
+            l2_normalize(&mut v);
+            return Ok(v);
+        }
+
         let outputs = onnx::run(&self.model, vec![("pixel_values", input)])
             .context("run image model")?;
         let pooler = outputs.get("pooler_output")
@@ -74,6 +111,8 @@ impl Embedder for SigLIP2ImageEmbedder {
 pub struct SigLIP2TextEmbedder {
     model: OnnxModel,
     tokenizer: BpeTokenizer,
+    #[cfg(feature = "gpu")]
+    gpu: Option<std::sync::Mutex<crate::gpu::GpuExecutor>>,
 }
 
 impl SigLIP2TextEmbedder {
@@ -82,7 +121,18 @@ impl SigLIP2TextEmbedder {
             .context("load siglip2 text model")?;
         let tokenizer = BpeTokenizer::load(tokenizer_path)
             .context("load tokenizer")?;
-        Ok(Self { model, tokenizer })
+
+        #[cfg(feature = "gpu")]
+        let gpu = crate::gpu::GpuContext::try_new().map(|ctx| {
+            std::sync::Mutex::new(crate::gpu::GpuExecutor::new(ctx))
+        });
+
+        Ok(Self {
+            model,
+            tokenizer,
+            #[cfg(feature = "gpu")]
+            gpu,
+        })
     }
 }
 
@@ -90,6 +140,18 @@ impl TextEmbedder for SigLIP2TextEmbedder {
     fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         let ids = self.tokenizer.encode(text, 64);
         let input = Tensor::i64(vec![1, 64], ids);
+
+        #[cfg(feature = "gpu")]
+        if let Some(ref gpu) = self.gpu {
+            let outputs = gpu.lock().unwrap().run(&self.model, vec![("input_ids", input)])
+                .context("gpu run text model")?;
+            let pooler = outputs.get("pooler_output")
+                .context("missing pooler_output")?;
+            let mut v = pooler.as_f32().to_vec();
+            l2_normalize(&mut v);
+            return Ok(v);
+        }
+
         let outputs = onnx::run(&self.model, vec![("input_ids", input)])
             .context("run text model")?;
         let pooler = outputs.get("pooler_output")

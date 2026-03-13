@@ -1,8 +1,8 @@
 [package]
 name        = "nanoimg"
-version     = "0.1.0"
+version     = "0.2.0"
 edition     = "2021"
-description = "Semantic image search in ~2200 lines of Rust"
+description = "Semantic image search in ~2500 lines of Rust (+ optional GPU)"
 license     = "MIT"
 readme      = "README.md"
 keywords    = ["image", "search", "semantic", "siglip", "onnx"]
@@ -12,7 +12,12 @@ categories  = ["multimedia::images", "command-line-utilities"]
 name = "nanoimg"
 path = "src/main.rs"
 
+[features]
+gpu = ["dep:wgpu", "dep:pollster"]
+
 [dependencies]
+wgpu     = { version = "28", optional = true }
+pollster = { version = "0.4", optional = true }
 clap        = { version = "4", features = ["derive"] }
 usearch     = "2"
 image       = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
