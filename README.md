@@ -64,6 +64,18 @@ cargo build --release                          # CPU + GPU (Vulkan/Metal/DX12 vi
 cargo build --release --no-default-features    # CPU only
 ```
 
+The compiled binary is at `target/release/nanoimg`. Run it directly:
+
+```
+./target/release/nanoimg ~/photos "sunset over water"
+```
+
+Or install it into your PATH so you can use `nanoimg` from anywhere:
+
+```
+cargo install --path .
+```
+
 GPU auto-detects at runtime. Falls back to CPU if no GPU found.
 
 ## Test
