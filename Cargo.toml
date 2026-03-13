@@ -2,7 +2,7 @@
 name        = "nanoimg"
 version     = "0.3.0"
 edition     = "2021"
-description = "Semantic image search in ~2800 lines of Rust"
+description = "Semantic image search in ~2400 lines of from-scratch Rust"
 license     = "MIT"
 readme      = "README.md"
 keywords    = ["image", "search", "semantic", "siglip", "onnx"]
