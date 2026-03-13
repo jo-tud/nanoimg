@@ -16,6 +16,11 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libopenblas-dev libx11-dev libxcursor-dev \
+          libxrandr-dev libxinerama-dev libxi-dev libgl-dev
     - name: Build
       run: cargo build --verbose
     - name: Run tests

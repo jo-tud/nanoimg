@@ -2,7 +2,7 @@
 name        = "nanoimg"
 version     = "0.2.0"
 edition     = "2021"
-description = "Semantic image search in ~2800 lines of Rust (+ optional GPU)"
+description = "Semantic image search in ~2800 lines of Rust"
 license     = "MIT"
 readme      = "README.md"
 keywords    = ["image", "search", "semantic", "siglip", "onnx"]
@@ -13,6 +13,7 @@ name = "nanoimg"
 path = "src/main.rs"
 
 [features]
+default = ["gpu"]
 gpu = ["dep:wgpu", "dep:pollster"]
 
 [dependencies]

@@ -1,6 +1,6 @@
 # nanoimg
 
-Semantic image search. ~2800 lines of Rust (+1400 optional GPU).
+Semantic image search. ~2600 lines of Rust (+1400 GPU backend).
 
 Point at a folder of images, ask a question in plain English.
 
@@ -61,8 +61,8 @@ Linux x86_64 + OpenBLAS:
 dnf install openblas-devel    # Fedora/RHEL
 apt install libopenblas-dev   # Debian/Ubuntu
 
-cargo build --release                   # CPU only
-cargo build --release --features gpu    # CPU + GPU (Vulkan/Metal/DX12 via wgpu)
+cargo build --release                          # CPU + GPU (Vulkan/Metal/DX12 via wgpu)
+cargo build --release --no-default-features    # CPU only
 ```
 
 GPU auto-detects at runtime. Falls back to CPU if no GPU found.
@@ -71,8 +71,7 @@ GPU auto-detects at runtime. Falls back to CPU if no GPU found.
 
 ```
 cargo test                              # unit tests (db, vector store)
-cargo test -- --ignored                 # integration tests (downloads models + images)
-cargo test --features gpu -- --ignored  # GPU correctness + benchmarks
+cargo test -- --ignored                 # integration tests (downloads models + images, GPU included by default)
 ```
 
 ## Data
