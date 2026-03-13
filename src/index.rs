@@ -177,11 +177,14 @@ pub fn run(
         indexed += results.len();
 
         if live {
+            clear_lines(prev_lines);
+            eprint!("\r\x1b[2K");
+            progress(indexed, total, &start);
             if let Some(qv) = query_vec {
-                clear_lines(prev_lines);
-                prev_lines = print_live(qv, limit, indexed, total, &dir_prefix, &db, &store, color, cutoff);
+                eprintln!();
+                prev_lines = 1 + print_live(qv, limit, indexed, total, &dir_prefix, &db, &store, color, cutoff);
             } else {
-                progress(indexed, total, &start);
+                prev_lines = 0;
             }
         }
     }
