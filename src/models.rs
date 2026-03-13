@@ -14,17 +14,17 @@ static MODELS: &[ModelSpec] = &[
     ModelSpec {
         filename: "siglip2_image.onnx",
         url: "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main/onnx/vision_model.onnx",
-        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        sha256: "c0573e3f4140c3a7c4e9cc5912bd6b26a033b46a6a8e8af26cbea262b163bcad",
     },
     ModelSpec {
         filename: "siglip2_text.onnx",
         url: "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main/onnx/text_model.onnx",
-        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        sha256: "baf12d941beabafafb14f7b4adb38dc15be18681b964a84410ec53d9d65e6293",
     },
     ModelSpec {
         filename: "tokenizer.json",
         url: "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main/tokenizer.json",
-        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        sha256: "158ed7e9c7518f251e4c43e934aad5d690e30e5c59168de467166491a6bc5bcf",
     },
 ];
 

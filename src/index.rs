@@ -4,13 +4,12 @@ use sha2::{Digest, Sha256};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
-use walkdir::WalkDir;
 
 use crate::backends::{cosine, Embedder};
 use crate::db::Database;
 use crate::store::VectorStore;
 
-const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "tiff", "tif", "webp"];
+const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "tiff", "tif", "webp", "avif"];
 const CHUNK_SIZE: usize = 64;
 const ANN_CANDIDATES: usize = 50;
 const EMBED_DIM: usize = 768;
@@ -88,39 +87,57 @@ pub fn run(
     cutoff: &CutoffMode,
 ) -> Result<Vec<(f64, String)>> {
     // dir is already canonicalized by caller
-    let dir_prefix = dir.to_string_lossy().into_owned();
+    let dir_prefix = format!("{}/", dir.to_string_lossy());
     let live = !quiet && std::io::stderr().is_terminal();
     let color = live && std::env::var_os("NO_COLOR").is_none();
 
-    let paths: Vec<(PathBuf, String)> = WalkDir::new(&dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            e.path()
-                .extension()
+    let mut all_files = Vec::new();
+    walk_files(&dir, &mut all_files);
+
+    let paths: Vec<(PathBuf, String)> = all_files.into_iter()
+        .filter(|p| {
+            p.extension()
                 .and_then(|s| s.to_str())
                 .map(|s| SUPPORTED_EXTS.contains(&s.to_lowercase().as_str()))
                 .unwrap_or(false)
         })
-        .filter(|e| {
+        .filter(|p| {
             if !update { return true; }
-            let path_str = e.path().to_string_lossy().to_string();
+            let path_str = p.to_string_lossy().to_string();
             if let Some((stored_mtime, stored_size)) = db.get_mtime_size(&path_str) {
-                if let Ok(meta) = std::fs::metadata(e.path()) {
+                if let Ok(meta) = std::fs::metadata(p) {
                     return mtime_secs(&meta) != stored_mtime
                         || meta.len() as i64 != stored_size;
                 }
             }
             true
         })
-        .filter_map(|e| {
-            let hash = quick_hash(e.path())?;
+        .filter_map(|p| {
+            let hash = quick_hash(&p)?;
             if db.has_hash(&hash) { return None; }
-            Some((e.into_path(), hash))
+            Some((p, hash))
         })
         .collect();
+
+    // Remove stale entries (files deleted from disk)
+    if update {
+        let mut disk_files = Vec::new();
+        walk_files(&dir, &mut disk_files);
+        let disk_paths: std::collections::HashSet<String> = disk_files.into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let mut removed = 0;
+        for stored in db.paths_with_prefix(&dir_prefix) {
+            if !disk_paths.contains(&stored) {
+                db.remove_path(&stored);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            db.commit()?;
+            if live { eprintln!("Removed {} stale entries.", removed); }
+        }
+    }
 
     // Nothing to index — just search
     if paths.is_empty() {
@@ -242,7 +259,7 @@ fn rank(
         .iter()
         .filter_map(|&key| {
             let path = db.get_path_by_image_id(key as i64).ok()?;
-            if !path.starts_with(dir_prefix) { return None; }
+            if path.is_empty() || !path.starts_with(dir_prefix) { return None; }
             let offset = db.get_vec_offset(key).ok()?;
             let v = store.read_f32(offset).ok()?;
             let score = cosine(qv, &v) as f64;
@@ -314,6 +331,24 @@ fn quick_hash(path: &Path) -> Option<String> {
     hasher.update(size.to_le_bytes());
     hasher.update(&buf[..n]);
     Some(format!("{:x}", hasher.finalize()))
+}
+
+fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if ft.is_dir() {
+            walk_files(&entry.path(), out);
+        } else if ft.is_file() {
+            out.push(entry.path());
+        }
+    }
 }
 
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {

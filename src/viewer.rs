@@ -1,7 +1,7 @@
 use anyhow::Result;
 use image::imageops::FilterType;
 use image::DynamicImage;
-use minifb::{Key, KeyRepeat, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -539,9 +539,65 @@ impl Viewer {
         false
     }
 
+    /// Find which item is at pixel (x, y) in the grid, accounting for scroll.
+    fn hit_test(&self, x: usize, y: usize) -> Option<usize> {
+        let abs_y = y + self.scroll_y;
+        for (i, cell) in self.layout.cells.iter().enumerate() {
+            if x >= cell.x && x < cell.x + cell.w
+                && abs_y >= cell.y && abs_y < cell.y + cell.h {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     fn handle_input(&mut self, window: &Window) {
         let total = self.items.len();
         let old_sel = self.sel;
+
+        // Mouse scroll (both grid and fullscreen)
+        if let Some((_, scroll_y)) = window.get_scroll_wheel() {
+            match self.state {
+                ViewState::Grid => {
+                    let step = 60;
+                    if scroll_y > 0.0 {
+                        self.scroll_y = self.scroll_y.saturating_sub(step);
+                    } else if scroll_y < 0.0 {
+                        self.scroll_y = (self.scroll_y + step).min(self.max_scroll());
+                    }
+                    self.dirty = true;
+                }
+                ViewState::Full => {
+                    if scroll_y > 0.0 {
+                        self.sel = self.sel.saturating_sub(1);
+                    } else if scroll_y < 0.0 {
+                        self.sel = (self.sel + 1).min(total - 1);
+                    }
+                }
+            }
+        }
+
+        // Mouse click
+        if window.get_mouse_down(MouseButton::Left) {
+            if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
+                let (mx, my) = (mx as usize, my as usize);
+                match self.state {
+                    ViewState::Grid => {
+                        if my < self.viewport_h() {
+                            if let Some(idx) = self.hit_test(mx, my) {
+                                if self.sel == idx {
+                                    // Double-click effect: already selected → fullscreen
+                                    self.state = ViewState::Full;
+                                }
+                                self.sel = idx;
+                                self.dirty = true;
+                            }
+                        }
+                    }
+                    ViewState::Full => {}
+                }
+            }
+        }
 
         match self.state {
             ViewState::Grid => {

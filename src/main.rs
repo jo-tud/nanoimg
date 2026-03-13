@@ -50,6 +50,10 @@ struct Cli {
     /// Score cutoff: auto (default), none, or a threshold (e.g. 0.2)
     #[arg(long, default_value = "auto")]
     cutoff: String,
+
+    /// Print scores alongside paths
+    #[arg(short = 's', long)]
+    scores: bool,
 }
 
 fn main() -> ExitCode {
@@ -146,8 +150,12 @@ fn run() -> anyhow::Result<bool> {
 
     // Print results to stdout
     if !results.is_empty() {
-        for (_, path) in &results {
-            println!("{}", path);
+        for (score, path) in &results {
+            if cli.scores {
+                println!("{:.4}\t{}", score, path);
+            } else {
+                println!("{}", path);
+            }
         }
 
         // Launch viewer if interactive and not suppressed

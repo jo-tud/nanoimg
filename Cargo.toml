@@ -1,6 +1,6 @@
 [package]
 name        = "nanoimg"
-version     = "0.2.0"
+version     = "0.3.0"
 edition     = "2021"
 description = "Semantic image search in ~2800 lines of Rust"
 license     = "MIT"
@@ -21,11 +21,10 @@ wgpu     = { version = "28", optional = true }
 pollster = { version = "0.4", optional = true }
 clap        = { version = "4", features = ["derive"] }
 usearch     = "2"
-image       = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+image       = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp", "avif"] }
 rayon       = "1"
 memmap2     = "0.9"
 anyhow      = "1"
-walkdir     = "2"
 ureq        = { version = "2", features = ["tls"] }
 sha2        = "0.10"
 libc        = "0.2"

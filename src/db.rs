@@ -168,6 +168,23 @@ impl Database {
         Ok(r.path.clone())
     }
 
+    /// Returns all stored paths that start with `prefix`.
+    pub fn paths_with_prefix(&self, prefix: &str) -> Vec<String> {
+        self.records.iter().map(|r| r.path.clone())
+            .filter(|p| p.starts_with(prefix))
+            .collect()
+    }
+
+    /// Mark a path as removed (clears its record but preserves indices).
+    pub fn remove_path(&mut self, path: &str) {
+        if let Some(&idx) = self.path_to_id.get(path) {
+            self.records[idx].path.clear();
+            self.records[idx].content_hash.clear();
+            self.path_to_id.remove(path);
+            self.dirty = true;
+        }
+    }
+
     pub fn begin(&self) -> Result<()> {
         Ok(())
     }

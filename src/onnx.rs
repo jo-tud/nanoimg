@@ -66,8 +66,6 @@ impl Tensor {
 pub struct OnnxModel {
     pub nodes: Vec<Node>,
     pub weights: HashMap<String, Tensor>,
-    #[allow(dead_code)]
-    pub graph_inputs: Vec<String>,
     pub graph_outputs: Vec<String>,
 }
 
@@ -303,7 +301,6 @@ impl OnnxModel {
         // Parse GraphProto
         let mut nodes = Vec::new();
         let mut raw_inits = Vec::new();
-        let mut graph_inputs = Vec::new();
         let mut graph_outputs = Vec::new();
 
         let mut r = PbReader::new(graph_data);
@@ -318,10 +315,7 @@ impl OnnxModel {
                     r.pos += len;
                     raw_inits.push(parse_tensor(bytes, abs));
                 }
-                (11, 2) => {
-                    let name = parse_value_info_name(r.read_len_bytes());
-                    if !name.is_empty() { graph_inputs.push(name); }
-                }
+                (11, 2) => { r.read_len_bytes(); } // graph_inputs (unused)
                 (12, 2) => {
                     let name = parse_value_info_name(r.read_len_bytes());
                     if !name.is_empty() { graph_outputs.push(name); }
@@ -360,11 +354,8 @@ impl OnnxModel {
             weights.insert(raw.name, tensor);
         }
 
-        // Filter graph_inputs to only actual runtime inputs (not initializers)
-        graph_inputs.retain(|name| !weights.contains_key(name));
-
         // mmap is dropped here — all weight data is in owned Vecs
-        Ok(OnnxModel { nodes, weights, graph_inputs, graph_outputs })
+        Ok(OnnxModel { nodes, weights, graph_outputs })
     }
 }
 

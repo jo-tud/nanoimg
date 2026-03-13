@@ -516,9 +516,6 @@ impl GpuExecutor {
         GpuExecutor { ctx, pipelines, weight_cache: HashMap::new() }
     }
 
-    #[allow(dead_code)]
-    pub fn name(&self) -> &str { &self.ctx.name }
-
     fn upload_f32(&self, data: &[f32]) -> wgpu::Buffer {
         self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,

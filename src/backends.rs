@@ -19,7 +19,7 @@ pub trait TextEmbedder: Send + Sync {
 
 pub fn l2_normalize(v: &mut Vec<f32>) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 1e-9 {
+    if norm > 1e-6 {
         for x in v.iter_mut() { *x /= norm; }
     }
 }
@@ -56,14 +56,6 @@ impl SigLIP2ImageEmbedder {
             #[cfg(feature = "gpu")]
             gpu,
         })
-    }
-
-    #[allow(dead_code)]
-    pub fn has_gpu(&self) -> bool {
-        #[cfg(feature = "gpu")]
-        { self.gpu.is_some() }
-        #[cfg(not(feature = "gpu"))]
-        { false }
     }
 
     fn preprocess(img: &DynamicImage) -> Vec<f32> {
