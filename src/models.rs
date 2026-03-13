@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
+use std::time::Instant;
 
 struct ModelSpec {
     filename: &'static str,
@@ -98,35 +98,36 @@ fn verify_sha256(dest: &Path, sha256: &str, label: &str) -> Result<()> {
 fn download_with_progress(url: &str, dest: &Path) -> Result<()> {
     let resp = ureq::get(url).call().context("HTTP GET")?;
     let total: Option<u64> = resp.header("content-length").and_then(|v| v.parse().ok());
-    let pb = match total {
-        Some(n) => {
-            let bar = ProgressBar::new(n);
-            bar.set_style(
-                ProgressStyle::with_template(
-                    "  {bar:40.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
-                )
-                .unwrap(),
-            );
-            bar
-        }
-        None => {
-            let bar = ProgressBar::new_spinner();
-            bar.set_style(
-                ProgressStyle::with_template("  {spinner} {bytes} downloaded").unwrap(),
-            );
-            bar
-        }
-    };
     let mut reader = resp.into_reader();
     let mut file = std::fs::File::create(dest).context("create dest file")?;
     let mut buf = vec![0u8; 65536];
+    let mut downloaded = 0u64;
+    let live = std::io::stderr().is_terminal();
+    let start = Instant::now();
     loop {
         let n = reader.read(&mut buf).context("read response body")?;
         if n == 0 { break; }
         file.write_all(&buf[..n]).context("write dest file")?;
-        pb.inc(n as u64);
+        downloaded += n as u64;
+        if live {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
+            if let Some(total) = total {
+                let pct = downloaded as f64 / total as f64;
+                let filled = (pct * 30.0) as usize;
+                let empty = 30 - filled.min(30);
+                eprint!("\r  [{}{}] {}/{} MB  {:.1} MB/s  ",
+                    "█".repeat(filled), "░".repeat(empty),
+                    downloaded / 1_000_000, total / 1_000_000,
+                    rate / 1_000_000.0);
+            } else {
+                eprint!("\r  {} MB  {:.1} MB/s  ",
+                    downloaded / 1_000_000, rate / 1_000_000.0);
+            }
+            std::io::stderr().flush().ok();
+        }
     }
-    pb.finish_and_clear();
+    if live { eprint!("\r\x1b[2K"); std::io::stderr().flush().ok(); }
     Ok(())
 }
 

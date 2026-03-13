@@ -2,7 +2,7 @@
 name        = "nanoimg"
 version     = "0.2.0"
 edition     = "2021"
-description = "Semantic image search in ~2500 lines of Rust (+ optional GPU)"
+description = "Semantic image search in ~2800 lines of Rust (+ optional GPU)"
 license     = "MIT"
 readme      = "README.md"
 keywords    = ["image", "search", "semantic", "siglip", "onnx"]
@@ -26,5 +26,6 @@ memmap2     = "0.9"
 anyhow      = "1"
 walkdir     = "2"
 ureq        = { version = "2", features = ["tls"] }
-indicatif   = "0.17"
 sha2        = "0.10"
+libc        = "0.2"
+minifb      = "0.28"

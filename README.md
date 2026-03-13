@@ -1,6 +1,6 @@
 # nanoimg
 
-Semantic image search. ~2500 lines of Rust (+1400 optional GPU).
+Semantic image search. ~2800 lines of Rust (+1400 optional GPU).
 
 Point at a folder of images, ask a question in plain English.
 
@@ -11,6 +11,24 @@ nanoimg --reindex ~/photos "cat"
 nanoimg --reindex
 ```
 
+Results are filtered by an adaptive score cutoff (Otsu's method on the similarity
+distribution). Override with `--cutoff none` or `--cutoff 0.2`.
+
+Pipe results to **feh** or any image viewer:
+
+```
+nanoimg ~/photos "sunset" --no-display | feh -f -
+```
+
+Pipe image paths in:
+
+```
+find ~/photos -name '*.jpg' | nanoimg
+```
+
+A built-in graphical viewer shows results in a justified grid.
+Use `--no-display` or pipe stdout to skip it.
+
 ## Nano spirit
 
 Everything that matters is from scratch:
@@ -19,9 +37,11 @@ Everything that matters is from scratch:
 |---|---|---|
 | ONNX runtime (21 ops) | 1100 | onnxruntime, tract |
 | GPU backend (11 WGSL shaders) | 1400 | cuDNN, wonnx |
+| Image viewer (minifb) | 680 | feh, eog |
 | Protobuf parser | 100 | prost, protobuf |
 | BPE tokenizer | 300 | tokenizers + serde_json |
 | Flat-file database | 150 | rusqlite |
+| Download progress bar | 15 | indicatif |
 
 [usearch](https://github.com/unum-cloud/usearch) handles HNSW.
 BLAS handles matmul. GPU backend uses wgpu compute shaders.
@@ -31,7 +51,7 @@ Everything else is hand-rolled.
 
 Images are embedded with [SigLIP2](https://huggingface.co/google/siglip2-base-patch16-224)
 and searched by cosine similarity against your text query. Models download automatically on
-first run (~350 MB to `~/.nanoimg/models/`). Results stream live as batches finish indexing.
+first run (~1.5 GB to `~/.nanoimg/models/`). Results stream live as batches finish indexing.
 
 ## Build
 
