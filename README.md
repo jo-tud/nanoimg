@@ -1,6 +1,6 @@
 # nanoimg
 
-Semantic image search. ~2600 lines of Rust (+1400 GPU backend).
+Semantic image search. ~2400 lines of from-scratch Rust (+1400 GPU).
 
 Point at a folder of images, ask a question in plain English.
 
@@ -35,13 +35,12 @@ Everything that matters is from scratch:
 
 | Component | ~lines | Replaces |
 |---|---|---|
-| ONNX runtime (21 ops) | 1100 | onnxruntime, tract |
+| ONNX runtime (21 ops) | 850 | onnxruntime, tract |
 | GPU backend (11 WGSL shaders) | 1400 | cuDNN, wonnx |
 | Image viewer (minifb) | 680 | feh, eog |
-| Protobuf parser | 100 | prost, protobuf |
+| Protobuf parser | 270 | prost, protobuf |
 | BPE tokenizer | 300 | tokenizers + serde_json |
-| Flat-file database | 150 | rusqlite |
-| Download progress bar | 15 | indicatif |
+| Flat-file database | 300 | rusqlite |
 
 [usearch](https://github.com/unum-cloud/usearch) handles HNSW.
 BLAS handles matmul. GPU backend uses wgpu compute shaders.
