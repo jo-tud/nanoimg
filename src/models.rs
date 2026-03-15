@@ -24,7 +24,7 @@ static MODELS: &[ModelSpec] = &[
     ModelSpec {
         filename: "tokenizer.json",
         url: "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main/tokenizer.json",
-        sha256: "158ed7e9c7518f251e4c43e934aad5d690e30e5c59168de467166491a6bc5bcf",
+        sha256: "cb9140fae3ac5122c972d37adf83e1248471a38147ad76f8215c8872c6fd8322",
     },
 ];
 
