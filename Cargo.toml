@@ -17,16 +17,16 @@ default = ["gpu"]
 gpu = ["dep:wgpu", "dep:pollster"]
 
 [dependencies]
-wgpu     = { version = "28", optional = true }
-pollster = { version = "0.4", optional = true }
+wgpu     = { version = "30", optional = true }
+pollster = { version = "1", optional = true }
 clap        = { version = "4", features = ["derive", "env"] }
 usearch     = "2"
 image       = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp", "avif"] }
 rayon       = "1"
 memmap2     = "0.9"
 anyhow      = "1"
-ureq        = { version = "2", features = ["tls"] }
-sha2        = "0.10"
+ureq        = { version = "3", default-features = false, features = ["rustls"] }
+sha2        = "0.11"
 libc        = "0.2"
 minifb      = "0.28"
 matrixmultiply = { version = "0.3", features = ["threading"] }

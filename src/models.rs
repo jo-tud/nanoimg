@@ -199,8 +199,11 @@ fn already_present(dest: &Path, sha256: &[&str]) -> Result<bool> {
 
 fn download_with_progress(url: &str, dest: &Path) -> Result<()> {
     let resp = ureq::get(url).call().context("HTTP GET")?;
-    let total: Option<u64> = resp.header("content-length").and_then(|v| v.parse().ok());
-    let mut reader = resp.into_reader();
+    let total: Option<u64> = resp.headers().get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
+    // into_reader() is unlimited (read_to_vec() would cap at 10 MB)
+    let mut reader = resp.into_body().into_reader();
     let mut file = std::fs::File::create(dest).context("create dest file")?;
     let mut buf = vec![0u8; 65536];
     let mut downloaded = 0u64;
@@ -233,6 +236,11 @@ fn download_with_progress(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Lowercase hex, as stored in index.dat and used for model checksums.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -242,12 +250,20 @@ fn sha256_file(path: &Path) -> Result<String> {
         if n == 0 { break; }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex(&hasher.finalize()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_hex_is_lowercase_and_stable() {
+        // reference: printf nanoimg | sha256sum
+        let digest = Sha256::digest(b"nanoimg");
+        assert_eq!(hex(&digest), "54d87eed0370effde73433c031cd006bd56666bacc6086b8fd35321fe4f4902d");
+        assert_eq!(hex(&[0x00, 0x0f, 0xab]), "000fab");
+    }
 
     #[test]
     fn calibration_inverts_sigmoid() {

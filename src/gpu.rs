@@ -23,9 +23,9 @@ impl GpuContext {
 
     /// `max_buffer`: cap on buffer size below the adapter's (tests force failures with it).
     fn with_buffer_limit(max_buffer: Option<u64>) -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -44,7 +44,7 @@ impl GpuContext {
                 required_limits: wgpu::Limits {
                     max_buffer_size: max_buffer,
                     max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size
-                        .min(max_buffer.min(u32::MAX as u64) as u32),
+                        .min(max_buffer),
                     ..wgpu::Limits::downlevel_defaults()
                 },
                 ..Default::default()
@@ -684,15 +684,16 @@ impl GpuExecutor {
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).ok(); });
         self.ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        // Mapping APIs panic on invalid buffers instead of reporting, so bail
-        // out first if anything (e.g. allocating `staging`) already failed
-        if self.has_error() || !matches!(rx.recv(), Ok(Ok(()))) {
+        // Any earlier failure (e.g. allocating `staging`) makes the data meaningless
+        let mapped = match rx.recv() {
+            Ok(Ok(())) if !self.has_error() => slice.get_mapped_range().ok(),
+            _ => None,
+        };
+        let Some(data) = mapped else {
             let mut slot = self.error.lock().unwrap_or_else(|p| p.into_inner());
             slot.get_or_insert_with(|| "failed to map result buffer".into());
             return vec![0.0; len];
-        }
-
-        let data = slice.get_mapped_range();
+        };
         let result: Vec<f32> = data.chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();

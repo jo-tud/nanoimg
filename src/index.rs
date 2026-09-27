@@ -338,7 +338,7 @@ fn quick_hash(path: &Path) -> Option<String> {
         let n = file.read(&mut buf).ok()?;
         hasher.update(&buf[..n]);
     }
-    Some(format!("{:x}", hasher.finalize()))
+    Some(crate::models::hex(&hasher.finalize()))
 }
 
 /// Decode an image and apply its EXIF orientation (portrait phone photos are
