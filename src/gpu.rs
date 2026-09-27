@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
-use wgpu::util::DeviceExt;
+use std::sync::{Arc, Mutex};
 
 use crate::onnx::{Node, OnnxModel, Tensor};
 use crate::shape::*;
@@ -18,6 +18,11 @@ pub struct GpuContext {
 
 impl GpuContext {
     pub fn try_new() -> Option<Self> {
+        Self::with_buffer_limit(None)
+    }
+
+    /// `max_buffer`: cap on buffer size below the adapter's (tests force failures with it).
+    fn with_buffer_limit(max_buffer: Option<u64>) -> Option<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12,
             ..Default::default()
@@ -31,12 +36,15 @@ impl GpuContext {
         };
         let name = adapter.get_info().name.clone();
         let adapter_limits = adapter.limits();
+        let max_buffer = max_buffer.unwrap_or(adapter_limits.max_buffer_size)
+            .min(adapter_limits.max_buffer_size);
         let (device, queue) = match pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("nanoimg"),
                 required_limits: wgpu::Limits {
-                    max_buffer_size: adapter_limits.max_buffer_size,
-                    max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+                    max_buffer_size: max_buffer,
+                    max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size
+                        .min(max_buffer.min(u32::MAX as u64) as u32),
                     ..wgpu::Limits::downlevel_defaults()
                 },
                 ..Default::default()
@@ -591,44 +599,64 @@ pub struct GpuExecutor {
     ctx: GpuContext,
     pipelines: Pipelines,
     weight_cache: HashMap<String, GpuTensor>,
+    /// First device error since the last check. wgpu's default handler panics;
+    /// ours records the error so `run` can fail cleanly (e.g. out of VRAM).
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl GpuExecutor {
     pub fn new(ctx: GpuContext) -> Self {
+        let error = Arc::new(Mutex::new(None));
+        let slot = error.clone();
+        ctx.device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+            let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.is_none() {
+                *slot = Some(error_chain(&e));
+            }
+        }));
         let pipelines = Pipelines::new(&ctx.device);
-        GpuExecutor { ctx, pipelines, weight_cache: HashMap::new() }
+        GpuExecutor { ctx, pipelines, weight_cache: HashMap::new(), error }
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    fn has_error(&self) -> bool {
+        self.error.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+    }
+
+    /// Create a buffer and fill it via the queue. (`create_buffer_init` maps the
+    /// buffer at creation, which panics instead of reporting when allocation fails.)
+    fn upload_bytes(&self, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        let size = (data.len() as u64).max(4).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+        let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if !data.is_empty() {
+            self.ctx.queue.write_buffer(&buffer, 0, data);
+        }
+        buffer
     }
 
     fn upload_f32(&self, data: &[f32]) -> wgpu::Buffer {
-        self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck_cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-        })
+        self.upload_bytes(bytemuck_cast_slice(data),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC)
     }
 
     fn upload_i32(&self, data: &[i32]) -> wgpu::Buffer {
-        self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck_cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        })
+        self.upload_bytes(bytemuck_cast_slice(data), wgpu::BufferUsages::STORAGE)
     }
 
     fn upload_u32(&self, data: &[u32]) -> wgpu::Buffer {
-        self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck_cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        })
+        self.upload_bytes(bytemuck_cast_slice(data), wgpu::BufferUsages::STORAGE)
     }
 
     fn create_uniform(&self, data: &[u8]) -> wgpu::Buffer {
-        self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: data,
-            usage: wgpu::BufferUsages::UNIFORM,
-        })
+        self.upload_bytes(data, wgpu::BufferUsages::UNIFORM)
     }
 
     fn create_storage(&self, size: u64) -> wgpu::Buffer {
@@ -656,7 +684,13 @@ impl GpuExecutor {
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).ok(); });
         self.ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        rx.recv().unwrap().unwrap();
+        // Mapping APIs panic on invalid buffers instead of reporting, so bail
+        // out first if anything (e.g. allocating `staging`) already failed
+        if self.has_error() || !matches!(rx.recv(), Ok(Ok(()))) {
+            let mut slot = self.error.lock().unwrap_or_else(|p| p.into_inner());
+            slot.get_or_insert_with(|| "failed to map result buffer".into());
+            return vec![0.0; len];
+        }
 
         let data = slice.get_mapped_range();
         let result: Vec<f32> = data.chunks_exact(4)
@@ -1066,8 +1100,24 @@ impl GpuExecutor {
 
     // ── Graph executor ───────────────────────────────────────────────────
 
+    /// Run the graph on the GPU. Device errors (out of memory, limits exceeded)
+    /// come back as `Err`; cached weights are dropped so a retry starts clean.
     pub fn run(&mut self, model: &OnnxModel, inputs: Vec<(&str, Tensor)>) -> Result<HashMap<String, Tensor>> {
+        self.take_error();
+        let result = self.run_graph(model, inputs);
+        if let Some(e) = self.take_error() {
+            // Buffers created during a failed pass may be invalid; don't reuse them.
+            // (wgpu keeps the failed pass's VRAM reserved — callers retrying with
+            // less memory should recreate the executor, see backends.rs.)
+            self.weight_cache.clear();
+            bail!("GPU error: {e}");
+        }
+        result
+    }
+
+    fn run_graph(&mut self, model: &OnnxModel, inputs: Vec<(&str, Tensor)>) -> Result<HashMap<String, Tensor>> {
         self.ensure_weights_cached(model);
+        if self.has_error() { bail!("uploading weights failed"); }
 
         let mut gpu_tensors: HashMap<String, GpuTensor> = HashMap::new();
         let mut cpu_tensors: HashMap<String, Tensor> = HashMap::new();
@@ -1325,6 +1375,7 @@ impl GpuExecutor {
             // so submit periodically to bound peak VRAM (one transformer layer ≈ 54 nodes)
             if i % FLUSH_EVERY == FLUSH_EVERY - 1 {
                 self.flush(&mut enc);
+                if self.has_error() { bail!("aborted at node {i}"); }
             }
         }
 
@@ -1346,6 +1397,22 @@ impl GpuExecutor {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// One line: error kind plus its most specific cause, e.g.
+/// "Out of Memory: Not enough memory left." (wgpu's Display spans several lines).
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let first_line = |s: String| s.lines().next().unwrap_or("").trim().to_string();
+    let mut innermost = None;
+    let mut src = e.source();
+    while let Some(s) = src {
+        innermost = Some(s);
+        src = s.source();
+    }
+    match innermost {
+        Some(cause) => format!("{}: {}", first_line(e.to_string()), first_line(cause.to_string())),
+        None => first_line(e.to_string()),
+    }
+}
 
 /// Byte casting for &[u32] / &[f32] / &[i32] → &[u8] (avoids direct bytemuck dep)
 fn bytemuck_cast_slice<T: Copy>(data: &[T]) -> &[u8] {
@@ -1385,6 +1452,27 @@ mod tests {
         let buf = exec.upload_f32(&data);
         let out = exec.download_f32(&buf, 1024);
         assert_eq!(data, out);
+    }
+
+    /// Device errors (here: buffers over the device limit, like running out of
+    /// VRAM) must come back as Err instead of panicking, and a fresh executor
+    /// must work afterwards.
+    #[test]
+    #[ignore]
+    fn gpu_error_is_returned_not_panicked() {
+        let Some(ctx) = GpuContext::with_buffer_limit(Some(1 << 20)) else { return };
+        let mut exec = GpuExecutor::new(ctx);
+        let model = OnnxModel::load(&model_dir().join("siglip2_image.onnx")).expect("load");
+        let input = || Tensor::f32(vec![1, 3, 224, 224], vec![0.1f32; 3 * 224 * 224]);
+        let err = exec.run(&model, vec![("pixel_values", input())]).err().expect("should fail");
+        eprintln!("{err:#}");
+        assert!(format!("{err:#}").contains("GPU error"), "{err:#}");
+        // The same executor reports (not panics) on the next try as well
+        assert!(exec.run(&model, vec![("pixel_values", input())]).is_err());
+
+        let mut fresh = GpuExecutor::new(GpuContext::try_new().unwrap());
+        let out = fresh.run(&model, vec![("pixel_values", input())]).expect("fresh device");
+        assert_eq!(out["pooler_output"].shape, vec![1, 768]);
     }
 
     #[test]

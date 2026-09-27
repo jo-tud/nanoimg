@@ -78,7 +78,10 @@ cargo build --release                          # CPU + GPU (Vulkan/Metal/DX12 vi
 cargo build --release --no-default-features    # CPU only
 ```
 
-GPU auto-detects at runtime. Falls back to CPU if no GPU found.
+GPU auto-detects at runtime. Falls back to CPU if no GPU is found. If the GPU runs
+out of memory, nanoimg halves the batch size and retries, and only switches to the
+CPU if even a single image does not fit. `NANOIMG_GPU_BATCH=4` sets the starting
+batch size (defaults: base 32, large 16, so400m 8 — about 2.1 / 2.7 / 4.5 GB VRAM).
 
 ## Test
 

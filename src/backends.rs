@@ -32,11 +32,28 @@ pub struct SigLIP2ImageEmbedder {
     model: OnnxModel,
     /// Square input resolution the vision tower was trained at
     size: usize,
+    /// None once no GPU was found or it failed even at batch size 1
     #[cfg(feature = "gpu")]
-    gpu: Option<std::sync::Mutex<crate::gpu::GpuExecutor>>,
-    /// Images per GPU forward pass
-    #[cfg(feature = "gpu")]
-    gpu_batch: usize,
+    gpu: std::sync::Mutex<Option<GpuRunner>>,
+}
+
+#[cfg(feature = "gpu")]
+struct GpuRunner {
+    exec: Option<crate::gpu::GpuExecutor>,
+    /// Images per forward pass; halved whenever a pass fails (out of VRAM)
+    batch: usize,
+}
+
+#[cfg(feature = "gpu")]
+impl GpuRunner {
+    /// Replace the device. wgpu keeps a failed pass's VRAM reserved, so a retry
+    /// on the same device fails even at sizes that normally fit.
+    fn reset(&mut self) -> Result<()> {
+        self.exec = None; // release the old device's memory first
+        let ctx = crate::gpu::GpuContext::try_new().context("GPU unavailable")?;
+        self.exec = Some(crate::gpu::GpuExecutor::new(ctx));
+        Ok(())
+    }
 }
 
 impl SigLIP2ImageEmbedder {
@@ -44,10 +61,16 @@ impl SigLIP2ImageEmbedder {
         let model = OnnxModel::load(model_path)
             .context("load siglip2 image model")?;
 
+        // NANOIMG_GPU_BATCH overrides the model default (tuning, small GPUs)
+        #[cfg(feature = "gpu")]
+        let batch = std::env::var("NANOIMG_GPU_BATCH").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(gpu_batch)
+            .max(1);
         #[cfg(feature = "gpu")]
         let gpu = crate::gpu::GpuContext::try_new().map(|ctx| {
             eprintln!("GPU: {}", ctx.name);
-            std::sync::Mutex::new(crate::gpu::GpuExecutor::new(ctx))
+            GpuRunner { exec: Some(crate::gpu::GpuExecutor::new(ctx)), batch }
         });
         #[cfg(feature = "gpu")]
         if gpu.is_none() {
@@ -58,9 +81,7 @@ impl SigLIP2ImageEmbedder {
             model,
             size,
             #[cfg(feature = "gpu")]
-            gpu,
-            #[cfg(feature = "gpu")]
-            gpu_batch: gpu_batch.max(1),
+            gpu: std::sync::Mutex::new(gpu),
         })
     }
 
@@ -93,16 +114,17 @@ fn pooled_embeddings(outputs: &std::collections::HashMap<String, Tensor>) -> Res
 impl Embedder for SigLIP2ImageEmbedder {
     fn embed_batch(&self, imgs: &[DynamicImage]) -> Result<Vec<Vec<f32>>> {
         #[cfg(feature = "gpu")]
-        if let Some(ref gpu) = self.gpu {
-            let mut out = Vec::with_capacity(imgs.len());
-            for batch in imgs.chunks(self.gpu_batch) {
-                let pixels: Vec<f32> = batch.par_iter().flat_map_iter(|img| self.preprocess(img)).collect();
-                let input = Tensor::f32(vec![batch.len(), 3, self.size, self.size], pixels);
-                let outputs = gpu.lock().unwrap().run(&self.model, vec![("pixel_values", input)])
-                    .context("gpu run image model")?;
-                out.extend(pooled_embeddings(&outputs)?);
+        {
+            let mut gpu = self.gpu.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(runner) = gpu.as_mut() {
+                match self.embed_gpu(runner, imgs) {
+                    Ok(out) => return Ok(out),
+                    Err(e) => {
+                        eprintln!("{e:#}; continuing on CPU");
+                        *gpu = None; // frees the device and its VRAM
+                    }
+                }
             }
-            return Ok(out);
         }
 
         // CPU: one image per rayon task keeps every core busy with small GEMMs
@@ -112,6 +134,35 @@ impl Embedder for SigLIP2ImageEmbedder {
                 .context("run image model")?;
             Ok(pooled_embeddings(&outputs)?.remove(0))
         }).collect()
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl SigLIP2ImageEmbedder {
+    /// Embed on the GPU, halving the batch size after each failed pass until it
+    /// fits. Errors only if a single image fails.
+    fn embed_gpu(&self, runner: &mut GpuRunner, imgs: &[DynamicImage]) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(imgs.len());
+        let mut done = 0;
+        while done < imgs.len() {
+            let batch = &imgs[done..(done + runner.batch).min(imgs.len())];
+            let pixels: Vec<f32> = batch.par_iter().flat_map_iter(|img| self.preprocess(img)).collect();
+            let input = Tensor::f32(vec![batch.len(), 3, self.size, self.size], pixels);
+            let exec = runner.exec.as_mut().context("GPU unavailable")?;
+            match exec.run(&self.model, vec![("pixel_values", input)]) {
+                Ok(outputs) => {
+                    out.extend(pooled_embeddings(&outputs)?);
+                    done += batch.len();
+                }
+                Err(e) if runner.batch > 1 => {
+                    runner.batch /= 2;
+                    eprintln!("{e:#}; retrying with GPU batch size {}", runner.batch);
+                    runner.reset()?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
     }
 }
 
