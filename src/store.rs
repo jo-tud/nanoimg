@@ -48,10 +48,6 @@ impl VectorStore {
         Ok(Self { dims, f32_file, f32_size, usearch, usearch_path })
     }
 
-    pub fn dims(&self) -> usize {
-        self.dims
-    }
-
     /// Append a vector; returns byte offset before write.
     pub fn append_f32(&mut self, v: &[f32]) -> Result<u64> {
         assert_eq!(v.len(), self.dims, "vector must be {}-dim", self.dims);

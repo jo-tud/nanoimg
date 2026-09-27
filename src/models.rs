@@ -20,6 +20,10 @@ pub struct Model {
     /// Images per GPU forward pass. Peak VRAM incl. weights, measured:
     /// base 2.1 GB, large 2.7 GB, so400m 4.5 GB (4.0 GB at batch 4, 5% slower).
     pub gpu_batch: usize,
+    /// SigLIP's learned calibration: P(match) = sigmoid(logit_scale · cos + logit_bias).
+    /// exp(logit_scale) and logit_bias from google/siglip2-* model.safetensors.
+    logit_scale: f64,
+    logit_bias: f64,
     image: FileSpec,
     text: FileSpec,
 }
@@ -47,6 +51,8 @@ pub static MODELS: &[Model] = &[
         image_size: 224,
         dims: 768,
         gpu_batch: 32,
+        logit_scale: 112.67,
+        logit_bias: -16.772,
         image: FileSpec {
             filename: "siglip2_image.onnx",
             url: hf!("siglip2-base-patch16-224-ONNX", "onnx/vision_model.onnx"),
@@ -64,6 +70,8 @@ pub static MODELS: &[Model] = &[
         image_size: 256,
         dims: 1024,
         gpu_batch: 16,
+        logit_scale: 108.05,
+        logit_bias: -16.348,
         image: FileSpec {
             filename: "siglip2-large_image_fp16.onnx",
             url: hf!("siglip2-large-patch16-256-ONNX", "onnx/vision_model_fp16.onnx"),
@@ -81,6 +89,8 @@ pub static MODELS: &[Model] = &[
         image_size: 384,
         dims: 1152,
         gpu_batch: 8,
+        logit_scale: 109.86,
+        logit_bias: -15.932,
         image: FileSpec {
             filename: "siglip2-so400m_image_fp16.onnx",
             url: hf!("siglip2-so400m-patch16-384-ONNX", "onnx/vision_model_fp16.onnx"),
@@ -112,6 +122,11 @@ impl Model {
 
     pub fn tokenizer(data_dir: &Path) -> PathBuf {
         data_dir.join("models").join(TOKENIZER.filename)
+    }
+
+    /// Cosine similarity at which the model's calibrated match probability is `p`.
+    pub fn score_at_probability(&self, p: f64) -> f64 {
+        ((p / (1.0 - p)).ln() - self.logit_bias) / self.logit_scale
     }
 
     /// Where this model's index lives. Embedding spaces differ between models,
@@ -228,4 +243,22 @@ fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibration_inverts_sigmoid() {
+        for m in MODELS {
+            for p in [1e-4, 3e-4, 0.5, 0.9] {
+                let cos = m.score_at_probability(p);
+                let back = 1.0 / (1.0 + (-(m.logit_scale * cos + m.logit_bias)).exp());
+                assert!((back - p).abs() < 1e-9 * p.max(1e-3), "{} p={p} back={back}", m.name);
+            }
+        }
+        // p = 0.5 sits near cos 0.15 for SigLIP2
+        assert!((find("base").unwrap().score_at_probability(0.5) - 0.1489).abs() < 1e-3);
+    }
 }

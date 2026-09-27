@@ -13,59 +13,6 @@ const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "tiff", "tif", "webp", "
 const CHUNK_SIZE: usize = 64;
 const ANN_CANDIDATES: usize = 50;
 
-/// Score cutoff strategy for filtering search results.
-pub enum CutoffMode {
-    /// Adaptive threshold via Otsu's method on the score distribution,
-    /// with a noise floor derived from embedding dimensionality.
-    Auto,
-    /// No cutoff — return all ANN candidates.
-    None,
-    /// Fixed user-specified threshold.
-    Fixed(f64),
-}
-
-// ── Adaptive cutoff ────────────────────────────────────────────────────────
-
-/// For L2-normalized embeddings in d dimensions, random cosine similarity
-/// has σ ≈ 1/√d. Scores below 3σ are indistinguishable from noise.
-/// Above that, Otsu's method finds the natural split between relevant
-/// and irrelevant clusters by maximizing between-class variance.
-fn adaptive_cutoff(scores: &mut Vec<f64>, dims: usize) -> f64 {
-    let noise_sigma = 1.0 / (dims as f64).sqrt();
-    let noise_floor = 3.0 * noise_sigma; // ~0.108 for 768-dim
-
-    scores.retain(|&s| s >= noise_floor);
-    scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    if scores.len() < 3 {
-        return noise_floor;
-    }
-
-    // Otsu's method: find threshold maximizing between-class variance
-    let n = scores.len();
-    let nf = n as f64;
-    let total_sum: f64 = scores.iter().sum();
-    let mut best_threshold = scores[0];
-    let mut best_variance = 0.0f64;
-    let mut w0 = 0.0f64;
-    let mut sum0 = 0.0f64;
-
-    for i in 0..n - 1 {
-        w0 += 1.0;
-        sum0 += scores[i];
-        let w1 = nf - w0;
-        let mean0 = sum0 / w0;
-        let mean1 = (total_sum - sum0) / w1;
-        let between_var = w0 * w1 * (mean0 - mean1).powi(2);
-        if between_var > best_variance {
-            best_variance = between_var;
-            best_threshold = (scores[i] + scores[i + 1]) / 2.0;
-        }
-    }
-
-    best_threshold.max(noise_floor)
-}
-
 struct IndexResult {
     path: PathBuf,
     mtime: i64,
@@ -84,7 +31,7 @@ pub fn run(
     data_dir: &Path,
     model: &crate::models::Model,
     quiet: bool,
-    cutoff: &CutoffMode,
+    min_score: f64,
 ) -> Result<Vec<(f64, String)>> {
     // dir is already canonicalized by caller
     let dir_prefix = format!("{}/", dir.to_string_lossy());
@@ -199,7 +146,7 @@ pub fn run(
     // Nothing to embed — just search
     if paths.is_empty() {
         if store_dirty { store.save()?; }
-        return Ok(query_vec.map(|qv| rank(qv, limit, &dir_prefix, &db, &store, cutoff)).unwrap_or_default());
+        return Ok(query_vec.map(|qv| rank(qv, limit, &dir_prefix, &db, &store, min_score)).unwrap_or_default());
     }
 
     let embedder = crate::backends::SigLIP2ImageEmbedder::load(
@@ -273,7 +220,7 @@ pub fn run(
             progress(indexed, total, &start);
             if let Some(qv) = query_vec {
                 eprintln!();
-                prev_lines = 1 + print_live(qv, limit, indexed, total, &dir_prefix, &db, &store, color, cutoff);
+                prev_lines = 1 + print_live(qv, limit, indexed, total, &dir_prefix, &db, &store, color, min_score);
             } else {
                 prev_lines = 0;
             }
@@ -288,7 +235,7 @@ pub fn run(
     }
 
     if let Some(qv) = query_vec {
-        Ok(rank(qv, limit, &dir_prefix, &db, &store, cutoff))
+        Ok(rank(qv, limit, &dir_prefix, &db, &store, min_score))
     } else {
         eprintln!("Indexed {} images.", indexed);
         Ok(vec![])
@@ -311,15 +258,12 @@ fn progress(indexed: usize, total: usize, start: &Instant) {
 
 // ── Search helpers ──────────────────────────────────────────────────────────
 
+/// Top matches in `dir_prefix` with cosine ≥ `min_score`, best first.
 fn rank(
     qv: &[f32], limit: usize, dir_prefix: &str,
-    db: &Database, store: &VectorStore, cutoff: &CutoffMode,
+    db: &Database, store: &VectorStore, min_score: f64,
 ) -> Vec<(f64, String)> {
-    // Auto mode needs a wider candidate pool for reliable score distribution
-    let candidates = match cutoff {
-        CutoffMode::Auto => 500,
-        _ => if limit == 0 { 200 } else { (limit * 3).clamp(ANN_CANDIDATES, 500) },
-    };
+    let candidates = if limit == 0 { 500 } else { (limit * 3).clamp(ANN_CANDIDATES, 500) };
     let candidates = candidates.min(store.usearch.size());
     if candidates == 0 { return vec![]; }
     // Filter inside the HNSW search so other folders can't crowd this one out
@@ -334,17 +278,7 @@ fn rank(
         .filter_map(|(&key, &dist)| Some((1.0 - dist as f64, db.path_of(key)?.to_string())))
         .collect();
 
-    // Apply cutoff
-    let threshold = match cutoff {
-        CutoffMode::Auto => {
-            let mut scores: Vec<f64> = all_scored.iter().map(|(s, _)| *s).collect();
-            adaptive_cutoff(&mut scores, store.dims())
-        }
-        CutoffMode::None => 0.0,
-        CutoffMode::Fixed(t) => *t,
-    };
-    all_scored.retain(|(s, _)| *s >= threshold);
-
+    all_scored.retain(|(s, _)| *s >= min_score);
     all_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     if limit > 0 { all_scored.truncate(limit); }
     all_scored
@@ -354,9 +288,9 @@ fn print_live(
     qv: &[f32], limit: usize,
     indexed: usize, total: usize,
     dir_prefix: &str, db: &Database, store: &VectorStore,
-    color: bool, cutoff: &CutoffMode,
+    color: bool, min_score: f64,
 ) -> usize {
-    let scored = rank(qv, limit, dir_prefix, db, store, cutoff);
+    let scored = rank(qv, limit, dir_prefix, db, store, min_score);
     if color {
         eprintln!("\x1b[2m[{}/{}]\x1b[0m", indexed, total);
     } else {
@@ -508,7 +442,7 @@ mod tests {
         add("/b/only.jpg", &unit(&[(0, 1.0), (1, 1.0)]));
 
         let q = unit(&[(0, 1.0)]);
-        let hits = rank(&q, 0, "/b/", &db, &store, &CutoffMode::None);
+        let hits = rank(&q, 0, "/b/", &db, &store, -1.0);
         assert_eq!(hits.len(), 1, "expected /b/only.jpg, got {hits:?}");
         assert_eq!(hits[0].1, "/b/only.jpg");
         assert!((hits[0].0 - 0.7071).abs() < 1e-3, "score {}", hits[0].0);

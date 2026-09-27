@@ -11,8 +11,9 @@ nanoimg --reindex ~/photos "cat"
 nanoimg --reindex
 ```
 
-Results are filtered by an adaptive score cutoff (Otsu's method on the similarity
-distribution). Override with `--cutoff none` or `--cutoff 0.2`.
+Results are filtered by the model's own calibrated match probability (SigLIP's
+sigmoid with its learned scale and bias), keeping images with P(match) ≥ 0.03%.
+Override with `--cutoff none` (closest matches, no filter) or a cosine like `--cutoff 0.12`.
 
 Pipe results to **feh** or any image viewer:
 

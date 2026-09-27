@@ -47,7 +47,7 @@ struct Cli {
     #[arg(long)]
     no_display: bool,
 
-    /// Score cutoff: auto (default), none, or a threshold (e.g. 0.2)
+    /// Score cutoff: auto (model-calibrated), none, or a cosine threshold (e.g. 0.12)
     #[arg(long, default_value = "auto")]
     cutoff: String,
 
@@ -140,22 +140,19 @@ fn run() -> anyhow::Result<bool> {
         None
     };
 
-    let cutoff = match cli.cutoff.as_str() {
-        "auto" => index::CutoffMode::Auto,
-        "none" => index::CutoffMode::None,
-        s => {
-            let v: f64 = s.parse().map_err(|_| {
-                anyhow::anyhow!("invalid --cutoff: {} (use auto, none, or a number like 0.2)", s)
-            })?;
-            index::CutoffMode::Fixed(v)
-        }
+    let min_score = match cli.cutoff.as_str() {
+        "auto" => model.score_at_probability(AUTO_MATCH_PROBABILITY),
+        "none" => -1.0,
+        s => s.parse().map_err(|_| {
+            anyhow::anyhow!("invalid --cutoff: {} (use auto, none, or a number like 0.12)", s)
+        })?,
     };
 
     let db = db::Database::open(&index_dir)?;
     let store = store::VectorStore::open(&index_dir, model.dims)?;
     let results = index::run(
         dir, !cli.reindex, query_vec.as_deref(), cli.limit, db, store, &data_dir, model,
-        cli.quiet, &cutoff,
+        cli.quiet, min_score,
     )?;
 
     // Print results to stdout
@@ -182,12 +179,22 @@ fn run() -> anyhow::Result<bool> {
         }
         Ok(true)
     } else if cli.query.is_some() {
-        eprintln!("No results.");
+        if cli.cutoff == "none" {
+            eprintln!("No results.");
+        } else {
+            eprintln!("No results above the cutoff (--cutoff none shows the closest matches).");
+        }
         Ok(false)
     } else {
         Ok(true)
     }
 }
+
+/// `--cutoff auto` keeps images whose SigLIP2 match probability is at least this.
+/// Tuned on 150 Imagenette photos × 38 EN/DE queries (see BENCH.md): 86–92%
+/// recall at ≥96% precision, 0–2 false hits over 12 queries with no match.
+/// The previous Otsu-based cutoff found only 38–44% of matching images.
+const AUTO_MATCH_PROBABILITY: f64 = 3e-4;
 
 fn data_dir() -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());

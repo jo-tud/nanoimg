@@ -60,3 +60,21 @@ Text model now always runs on the CPU, with weights read zero-copy from the mapp
 
 fp16 weights are widened to f32 on first use; token-embedding rows are widened
 per query only (saves ~1 GB RSS for large/so400m).
+
+## Auto cutoff (v0.4)
+
+`python3 eval/cutoff.py` — 150 Imagenette photos (10 classes × 15), 38 queries in
+English and German (26 with matches, 12 without, e.g. "Katze", "Strand").
+F1/precision/recall averaged over queries with matches.
+
+| Model | Cutoff | F1 | Precision | Recall | False hits (12 no-match queries) |
+|---|---|---|---|---|---|
+| base | v0.3: 3σ noise floor + Otsu | 0.51 | 0.96 | 0.38 | 0 |
+| base | v0.4: P(match) ≥ 3·10⁻⁴ | 0.94 | 0.99 | 0.92 | 2 |
+| large | v0.3 | 0.56 | 0.96 | 0.43 | 0 |
+| large | v0.4 | 0.90 | 0.99 | 0.86 | 1 |
+| so400m | v0.3 | 0.58 | 1.00 | 0.44 | 0 |
+| so400m | v0.4 | 0.92 | 0.99 | 0.89 | 0 |
+
+Otsu split the matching images themselves; the calibrated threshold is also
+independent of library size. Thresholds from 1·10⁻⁴ to 5·10⁻⁴ perform within ±0.03 F1.
