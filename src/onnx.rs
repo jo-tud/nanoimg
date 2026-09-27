@@ -1,9 +1,10 @@
 //! Minimal ONNX runtime tailored to SigLIP2 models.
 //! Supports the 21 operators used by the image and text encoders.
-//! Weight data is loaded from protobuf into owned tensors at model load time.
+//! Weights stay in the memory-mapped model file where alignment allows (zero-copy,
+//! pages load on first touch); misaligned or non-raw weights are copied out.
 
 use anyhow::{bail, Context, Result};
-use memmap2::MmapOptions;
+use memmap2::{Mmap, MmapOptions};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,6 +47,9 @@ pub struct Tensor {
 pub enum TData {
     F32(Arc<Vec<f32>>),
     I64(Arc<Vec<i64>>),
+    /// f32 weights borrowed from the mapped model file: (map, byte offset, element count).
+    /// The offset is 4-byte aligned (checked at load).
+    F32Mapped(Arc<Mmap>, usize, usize),
 }
 
 impl Tensor {
@@ -56,16 +60,21 @@ impl Tensor {
         Self { shape, data: TData::I64(Arc::new(data)) }
     }
     pub fn as_f32(&self) -> &[f32] {
-        match &self.data { TData::F32(v) => v, _ => panic!("expected f32") }
+        match &self.data {
+            TData::F32(v) => v,
+            // SAFETY: offset is 4-aligned (mmap base is page-aligned) and in bounds,
+            // checked when the tensor was created; the map is read-only and kept alive by the Arc.
+            TData::F32Mapped(map, off, len) => unsafe {
+                std::slice::from_raw_parts(map.as_ptr().add(*off) as *const f32, *len)
+            },
+            _ => panic!("expected f32"),
+        }
     }
     pub fn as_i64(&self) -> &[i64] {
         match &self.data { TData::I64(v) => v, _ => panic!("expected i64") }
     }
-    pub fn numel(&self) -> usize {
-        self.shape.iter().product::<usize>().max(1)
-    }
     pub fn is_f32(&self) -> bool {
-        matches!(&self.data, TData::F32(_))
+        !matches!(&self.data, TData::I64(_))
     }
 }
 
@@ -286,7 +295,7 @@ impl OnnxModel {
     pub fn load(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)
             .with_context(|| format!("open {}", path.display()))?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let mmap = Arc::new(unsafe { MmapOptions::new().map(&file)? });
         let mmap_data = &mmap[..];
 
         // Parse ModelProto → find GraphProto (field 7)
@@ -338,6 +347,10 @@ impl OnnxModel {
             let tensor = if raw.raw_data_len > 0 {
                 let bytes = &mmap_data[raw.raw_data_offset..raw.raw_data_offset + raw.raw_data_len];
                 match raw.data_type {
+                    1 if cfg!(target_endian = "little") && raw.raw_data_offset % 4 == 0 => Tensor {
+                        shape: raw.dims,
+                        data: TData::F32Mapped(mmap.clone(), raw.raw_data_offset, raw.raw_data_len / 4),
+                    },
                     1 => {
                         let data: Vec<f32> = bytes.chunks_exact(4)
                             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -362,7 +375,6 @@ impl OnnxModel {
             weights.insert(raw.name, tensor);
         }
 
-        // mmap is dropped here — all weight data is in owned Vecs
         Ok(OnnxModel { nodes, weights, graph_outputs })
     }
 }
@@ -488,38 +500,39 @@ fn op_conv(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>, node: &Node) 
 
     let in_data = input.as_f32();
     let w_data = weight.as_f32();
-
-    // im2col
+    let mut out = vec![0f32; n_batch * c_out * n_patches];
     let mut col = vec![0f32; n_patches * patch];
-    for py in 0..h_out {
-        for px in 0..w_out {
-            let (ys, xs) = (py * sh, px * sw);
-            let pi = py * w_out + px;
-            for c in 0..c_in {
-                for ky in 0..kh {
-                    for kx in 0..kw {
-                        col[pi * patch + c * kh * kw + ky * kw + kx] =
-                            in_data[c * h * w + (ys + ky) * w + (xs + kx)];
+
+    for (img, out) in in_data.chunks_exact(c_in * h * w).zip(out.chunks_exact_mut(c_out * n_patches)) {
+        // im2col
+        for py in 0..h_out {
+            for px in 0..w_out {
+                let (ys, xs) = (py * sh, px * sw);
+                let pi = py * w_out + px;
+                for c in 0..c_in {
+                    for ky in 0..kh {
+                        for kx in 0..kw {
+                            col[pi * patch + c * kh * kw + ky * kw + kx] =
+                                img[c * h * w + (ys + ky) * w + (xs + kx)];
+                        }
                     }
                 }
             }
         }
-    }
 
-    // weight [c_out, patch] × col^T [patch, n_patches] → [c_out, n_patches] directly
-    let mut out = vec![0f32; c_out * n_patches];
-    sgemm(false, true, c_out, n_patches, patch,
-          1.0, w_data, patch,
-          &col, patch,
-          0.0, &mut out, n_patches);
+        // weight [c_out, patch] × col^T [patch, n_patches] → [c_out, n_patches] directly
+        sgemm(false, true, c_out, n_patches, patch,
+              1.0, w_data, patch,
+              &col, patch,
+              0.0, out, n_patches);
 
-    // Add bias ([c_out, n_patches] layout)
-    if let Some(bias) = bias {
-        let b = bias.as_f32();
-        for j in 0..c_out {
-            let row = &mut out[j * n_patches..(j + 1) * n_patches];
-            let bj = b[j];
-            for v in row { *v += bj; }
+        // Add bias ([c_out, n_patches] layout)
+        if let Some(bias) = bias {
+            let b = bias.as_f32();
+            for j in 0..c_out {
+                let bj = b[j];
+                for v in &mut out[j * n_patches..(j + 1) * n_patches] { *v += bj; }
+            }
         }
     }
 
@@ -620,19 +633,22 @@ fn op_reduce_mean(data: &Tensor, axes: &[i64], keepdims: bool) -> Tensor {
 }
 
 fn op_reshape(data: &Tensor, shape: &Tensor) -> Tensor {
-    let shape_vals = shape.as_i64();
-    let total: usize = data.numel();
-    let mut new_shape: Vec<usize> = shape_vals.iter().map(|&v| {
-        if v == 0 { 1 } else if v == -1 { 0 } else { v as usize }
-    }).collect();
+    Tensor { shape: reshape_dims(&data.shape, shape.as_i64()), data: data.data.clone() }
+}
 
-    // Resolve -1
-    let known: usize = new_shape.iter().filter(|&&v| v != 0).product::<usize>().max(1);
-    for v in &mut new_shape {
+/// Resolve an ONNX Reshape target (allowzero=0): 0 copies the input dim, -1 is inferred.
+pub fn reshape_dims(in_shape: &[usize], target: &[i64]) -> Vec<usize> {
+    let total: usize = in_shape.iter().product::<usize>().max(1);
+    let mut out: Vec<usize> = target.iter().enumerate().map(|(i, &v)| match v {
+        0 => in_shape.get(i).copied().unwrap_or(1),
+        -1 => 0,
+        v => v as usize,
+    }).collect();
+    let known: usize = out.iter().filter(|&&v| v != 0).product::<usize>().max(1);
+    for v in &mut out {
         if *v == 0 { *v = total / known; }
     }
-
-    Tensor { shape: new_shape, data: data.data.clone() }
+    out
 }
 
 fn op_transpose(data: &Tensor, perm: Option<&[i64]>) -> Tensor {
@@ -821,7 +837,8 @@ fn op_gather(data: &Tensor, indices: &Tensor, axis: i64) -> Tensor {
     let idx_count: usize = indices.shape.iter().product::<usize>().max(1);
 
     match &data.data {
-        TData::F32(dv) => {
+        TData::F32(_) | TData::F32Mapped(..) => {
+            let dv = data.as_f32();
             let mut out = vec![0f32; out_shape.iter().product::<usize>().max(1)];
             for o in 0..outer {
                 for (ip, &iv) in idx.iter().enumerate() {

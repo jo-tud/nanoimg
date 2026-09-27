@@ -5,7 +5,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use crate::backends::{cosine, Embedder};
+use crate::backends::Embedder;
 use crate::db::Database;
 use crate::store::VectorStore;
 
@@ -214,27 +214,46 @@ pub fn run(
     let mut prev_lines = 0usize;
     let start = Instant::now();
 
-    for chunk in paths.chunks(CHUNK_SIZE) {
-        let results: Vec<IndexResult> = chunk
-            .par_iter()
+    // Decoding runs on the CPU while the previous chunk is embedded (on the GPU),
+    // so neither side waits for the other.
+    let decode = |chunk: &'_ [(PathBuf, String)]| -> Vec<(PathBuf, String, std::fs::Metadata, image::DynamicImage)> {
+        chunk.par_iter()
             .filter_map(|(path, hash)| {
                 let meta = std::fs::metadata(path).ok()?;
                 let img = open_oriented(path)
                     .map_err(|e| eprintln!("skip {}: {}", path.display(), e))
                     .ok()?;
-                let img = thumbnail(&img, 1024);
-                let embed = match embedder.embed(&img) {
-                    Ok(v) if v.len() == EMBED_DIM => v,
-                    Ok(_) => { eprintln!("skip {}: bad embed dim", path.display()); return None; }
-                    Err(e) => { eprintln!("skip {}: {}", path.display(), e); return None; }
-                };
-                Some(IndexResult {
-                    path: path.clone(),
-                    mtime: mtime_secs(&meta),
-                    size: meta.len() as i64,
-                    embed,
-                    content_hash: hash.clone(),
-                })
+                Some((path.clone(), hash.clone(), meta, thumbnail(&img, 1024)))
+            })
+            .collect()
+    };
+    let chunks: Vec<&[(PathBuf, String)]> = paths.chunks(CHUNK_SIZE).collect();
+    let mut next = chunks.first().map(|c| decode(c)).unwrap_or_default();
+
+    for ci in 0..chunks.len() {
+        let (meta, imgs): (Vec<_>, Vec<_>) = std::mem::take(&mut next).into_iter()
+            .map(|(path, hash, meta, img)| ((path, hash, meta), img))
+            .unzip();
+        let (embeds, decoded_next) = rayon::join(
+            || embedder.embed_batch(&imgs),
+            || chunks.get(ci + 1).map(|c| decode(c)).unwrap_or_default(),
+        );
+        next = decoded_next;
+        let embeds = match embeds {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skip {} images: {:#}", imgs.len(), e);
+                continue;
+            }
+        };
+        let results: Vec<IndexResult> = meta.into_iter().zip(embeds)
+            .filter(|(_, embed)| embed.len() == EMBED_DIM)
+            .map(|((path, hash, meta), embed)| IndexResult {
+                path,
+                mtime: mtime_secs(&meta),
+                size: meta.len() as i64,
+                embed,
+                content_hash: hash,
             })
             .collect();
 
@@ -305,23 +324,16 @@ fn rank(
     };
     let candidates = candidates.min(store.usearch.size());
     if candidates == 0 { return vec![]; }
-    let results = match store.usearch.search(qv, candidates) {
+    // Filter inside the HNSW search so other folders can't crowd this one out
+    let in_dir = |key: u64| db.path_of(key).is_some_and(|p| p.starts_with(dir_prefix));
+    let results = match store.usearch.filtered_search(qv, candidates, in_dir) {
         Ok(r) => r,
         Err(_) => return vec![],
     };
 
-    // Score all candidates (no filtering yet)
-    let mut all_scored: Vec<(f64, String)> = results
-        .keys
-        .iter()
-        .filter_map(|&key| {
-            let path = db.get_path_by_image_id(key as i64).ok()?;
-            if path.is_empty() || !path.starts_with(dir_prefix) { return None; }
-            let offset = db.get_vec_offset(key).ok()?;
-            let v = store.read_f32(offset).ok()?;
-            let score = cosine(qv, &v) as f64;
-            Some((score, path))
-        })
+    // IP distance is 1 - dot; vectors are L2-normalized, so dot = cosine
+    let mut all_scored: Vec<(f64, String)> = results.keys.iter().zip(&results.distances)
+        .filter_map(|(&key, &dist)| Some((1.0 - dist as f64, db.path_of(key)?.to_string())))
         .collect();
 
     // Apply cutoff
@@ -452,4 +464,56 @@ fn thumbnail(img: &image::DynamicImage, max_dim: u32) -> image::DynamicImage {
         return img.clone();
     }
     img.thumbnail(max_dim, max_dim)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(dims: &[(usize, f32)]) -> Vec<f32> {
+        let mut v = vec![0f32; EMBED_DIM];
+        for &(i, x) in dims { v[i] = x; }
+        crate::backends::l2_normalize(&mut v);
+        v
+    }
+
+    /// `base` plus small deterministic noise in every dimension, normalized.
+    fn noisy(base: &[f32], seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut v: Vec<f32> = base.iter().map(|&x| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x + ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.01
+        }).collect();
+        crate::backends::l2_normalize(&mut v);
+        v
+    }
+
+    /// Other folders must not crowd a folder's images out of the ANN candidate pool.
+    #[test]
+    fn rank_finds_folder_despite_closer_matches_elsewhere() {
+        let dir = std::env::temp_dir().join(format!("nanoimg_rank_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Database::open(&dir).unwrap();
+        let mut store = VectorStore::open(&dir).unwrap();
+        store.reserve(700).unwrap();
+        let mut add = |path: &str, v: &[f32]| {
+            let off = store.append_f32(v).unwrap();
+            let id = db.insert_image(path, 0, 0, off, path).unwrap();
+            store.upsert(id as u64, v).unwrap();
+        };
+        // 600 near-perfect matches in /a, one weaker match in /b
+        let near = unit(&[(0, 1.0)]);
+        for i in 0..600 {
+            add(&format!("/a/{i}.jpg"), &noisy(&near, i));
+        }
+        add("/b/only.jpg", &unit(&[(0, 1.0), (1, 1.0)]));
+
+        let q = unit(&[(0, 1.0)]);
+        let hits = rank(&q, 0, "/b/", &db, &store, &CutoffMode::None);
+        assert_eq!(hits.len(), 1, "expected /b/only.jpg, got {hits:?}");
+        assert_eq!(hits[0].1, "/b/only.jpg");
+        assert!((hits[0].0 - 0.7071).abs() < 1e-3, "score {}", hits[0].0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

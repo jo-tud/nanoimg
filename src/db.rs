@@ -169,12 +169,19 @@ impl Database {
         }
     }
 
+    #[cfg(test)]
     pub fn get_vec_offset(&self, image_id: u64) -> Result<u64> {
         let idx = image_id.checked_sub(1)
             .ok_or_else(|| anyhow::anyhow!("invalid id 0"))? as usize;
         let r = self.records.get(idx)
             .ok_or_else(|| anyhow::anyhow!("id {image_id} out of range"))?;
         Ok(r.vec_offset)
+    }
+
+    /// Path of a live record (None for unknown or removed ids).
+    pub fn path_of(&self, image_id: u64) -> Option<&str> {
+        let r = self.records.get((image_id as usize).checked_sub(1)?)?;
+        (!r.path.is_empty()).then_some(r.path.as_str())
     }
 
     pub fn get_path_by_image_id(&self, image_id: i64) -> Result<String> {
