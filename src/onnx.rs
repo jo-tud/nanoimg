@@ -1,5 +1,5 @@
 //! Minimal ONNX runtime tailored to SigLIP2 models.
-//! Supports the 21 operators used by the image and text encoders.
+//! Supports the 22 operators used by the SigLIP2 image and text encoders.
 //! Weights stay in the memory-mapped model file where alignment allows (zero-copy,
 //! pages load on first touch); misaligned or non-raw weights are copied out.
 

@@ -1,6 +1,6 @@
 # nanoimg
 
-Semantic image search. ~2400 lines of from-scratch Rust (+1400 GPU).
+Semantic image search. ~2750 lines of from-scratch Rust (+1600 GPU).
 
 Point at a folder of images, ask a question in plain English.
 
@@ -36,12 +36,12 @@ Everything that matters is from scratch:
 
 | Component | ~lines | Replaces |
 |---|---|---|
-| ONNX runtime (21 ops) | 850 | onnxruntime, tract |
-| GPU backend (11 WGSL shaders) | 1400 | cuDNN, wonnx |
-| Image viewer (minifb) | 680 | feh, eog |
-| Protobuf parser | 270 | prost, protobuf |
-| BPE tokenizer | 300 | tokenizers + serde_json |
-| Flat-file database | 300 | rusqlite |
+| ONNX runtime (22 ops) | 990 | onnxruntime, tract |
+| GPU backend (11 WGSL shaders) | 1600 | cuDNN, wonnx |
+| Image viewer (minifb) | 740 | feh, eog |
+| Protobuf parser | 280 | prost, protobuf |
+| BPE tokenizer | 370 | tokenizers + serde_json |
+| Flat-file database | 370 | rusqlite |
 
 [usearch](https://github.com/unum-cloud/usearch) handles HNSW.
 [matrixmultiply](https://github.com/bluss/matrixmultiply) handles matmul (pure Rust, no system BLAS).
