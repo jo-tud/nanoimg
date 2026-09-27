@@ -668,7 +668,7 @@ impl GpuExecutor {
     }
 
     fn upload_tensor(&self, t: &Tensor) -> GpuTensor {
-        GpuTensor { shape: t.shape.clone(), buffer: self.upload_f32(t.as_f32()) }
+        GpuTensor { shape: t.shape.clone(), buffer: self.upload_f32(&t.f32_data()) }
     }
 
     fn ensure_weights_cached(&mut self, model: &OnnxModel) {
@@ -1294,6 +1294,15 @@ impl GpuExecutor {
                     let dims: Vec<i64> = shape.iter().map(|&s| s as i64).collect();
                     cpu_tensors.insert(out_name.clone(), Tensor::i64(vec![dims.len()], dims));
                 }
+                "Cast" => {
+                    if let Some(a) = get_gpu(0) {
+                        crate::onnx::check_cast(node, true)?;
+                        gpu_tensors.insert(out_name.clone(), a.reshape(a.shape.clone()));
+                    } else {
+                        let a_cpu = get_cpu(0).with_context(|| format!("Cast: no input, node {}", i))?;
+                        cpu_tensors.insert(out_name.clone(), crate::onnx::op_cast(a_cpu, node)?);
+                    }
+                }
                 "Tile" => {
                     let data = get_gpu(0).with_context(|| format!("missing input for Tile node {}", i))?;
                     let repeats_t = get_cpu(1)
@@ -1394,28 +1403,38 @@ mod tests {
     }
 
     /// Batched GPU inference (Conv, Reshape, attention pooling over B > 1, and
-    /// matmuls larger than one 64x64 tile) must equal per-image CPU inference.
+    /// matmuls larger than one 64x64 tile) must equal per-image CPU inference —
+    /// for every installed model, including the fp16 ones.
     #[test]
     #[ignore]
     fn gpu_batch_matches_cpu_singles() {
-        let ctx = match GpuContext::try_new() { Some(c) => c, None => return };
-        let mut exec = GpuExecutor::new(ctx);
-        let model = OnnxModel::load(&model_dir().join("siglip2_image.onnx")).expect("load");
-        let n = 3 * 224 * 224;
-        let imgs: Vec<Vec<f32>> = (0..3).map(|k| {
-            (0..n).map(|i| (((i * (k + 1) * 7919) % 1000) as f32 / 1000.0) - 0.5).collect()
-        }).collect();
-        let batch = Tensor::f32(vec![3, 3, 224, 224], imgs.concat());
-        let gpu = exec.run(&model, vec![("pixel_values", batch)]).expect("gpu");
-        let pooled = &gpu["pooler_output"];
-        assert_eq!(pooled.shape, vec![3, 768]);
-        for (k, img) in imgs.into_iter().enumerate() {
-            let single = Tensor::f32(vec![1, 3, 224, 224], img);
-            let cpu = crate::onnx::run(&model, vec![("pixel_values", single)]).expect("cpu");
-            let c = cosine(&pooled.as_f32()[k * 768..(k + 1) * 768], cpu["pooler_output"].as_f32());
-            eprintln!("batch item {k} cosine: {c:.6}");
-            assert!(c > 0.999, "item {k} diverges: {c}");
+        let data_dir = model_dir().parent().unwrap().to_path_buf();
+        let mut tested = 0;
+        for m in crate::models::MODELS {
+            let path = m.image_model(&data_dir);
+            if !path.exists() { eprintln!("{}: not installed, skipped", m.name); continue; }
+            let ctx = match GpuContext::try_new() { Some(c) => c, None => return };
+            let mut exec = GpuExecutor::new(ctx);
+            let model = OnnxModel::load(&path).expect("load");
+            let n = 3 * m.image_size * m.image_size;
+            let imgs: Vec<Vec<f32>> = (0..3).map(|k| {
+                (0..n).map(|i| (((i * (k + 1) * 7919) % 1000) as f32 / 1000.0) - 0.5).collect()
+            }).collect();
+            let batch = Tensor::f32(vec![3, 3, m.image_size, m.image_size], imgs.concat());
+            let gpu = exec.run(&model, vec![("pixel_values", batch)]).expect("gpu");
+            let pooled = &gpu["pooler_output"];
+            assert_eq!(pooled.shape, vec![3, m.dims], "{}", m.name);
+            for (k, img) in imgs.into_iter().enumerate() {
+                let single = Tensor::f32(vec![1, 3, m.image_size, m.image_size], img);
+                let cpu = crate::onnx::run(&model, vec![("pixel_values", single)]).expect("cpu");
+                let got = &pooled.as_f32()[k * m.dims..(k + 1) * m.dims];
+                let c = cosine(got, cpu["pooler_output"].as_f32());
+                eprintln!("{} batch item {k} cosine: {c:.6}", m.name);
+                assert!(c > 0.999, "{} item {k} diverges: {c}", m.name);
+            }
+            tested += 1;
         }
+        assert!(tested > 0, "no models installed");
     }
 
     #[test]

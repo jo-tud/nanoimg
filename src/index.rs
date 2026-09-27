@@ -12,7 +12,6 @@ use crate::store::VectorStore;
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "tiff", "tif", "webp", "avif"];
 const CHUNK_SIZE: usize = 64;
 const ANN_CANDIDATES: usize = 50;
-const EMBED_DIM: usize = 768;
 
 /// Score cutoff strategy for filtering search results.
 pub enum CutoffMode {
@@ -31,8 +30,8 @@ pub enum CutoffMode {
 /// has σ ≈ 1/√d. Scores below 3σ are indistinguishable from noise.
 /// Above that, Otsu's method finds the natural split between relevant
 /// and irrelevant clusters by maximizing between-class variance.
-fn adaptive_cutoff(scores: &mut Vec<f64>) -> f64 {
-    let noise_sigma = 1.0 / (EMBED_DIM as f64).sqrt();
+fn adaptive_cutoff(scores: &mut Vec<f64>, dims: usize) -> f64 {
+    let noise_sigma = 1.0 / (dims as f64).sqrt();
     let noise_floor = 3.0 * noise_sigma; // ~0.108 for 768-dim
 
     scores.retain(|&s| s >= noise_floor);
@@ -83,6 +82,7 @@ pub fn run(
     mut db: Database,
     mut store: VectorStore,
     data_dir: &Path,
+    model: &crate::models::Model,
     quiet: bool,
     cutoff: &CutoffMode,
 ) -> Result<Vec<(f64, String)>> {
@@ -202,11 +202,9 @@ pub fn run(
         return Ok(query_vec.map(|qv| rank(qv, limit, &dir_prefix, &db, &store, cutoff)).unwrap_or_default());
     }
 
-    let img_model = data_dir.join("models").join("siglip2_image.onnx");
-    if !img_model.exists() {
-        anyhow::bail!("siglip2_image.onnx not found");
-    }
-    let embedder = crate::backends::SigLIP2ImageEmbedder::load(&img_model)?;
+    let embedder = crate::backends::SigLIP2ImageEmbedder::load(
+        &model.image_model(data_dir), model.image_size, model.gpu_batch,
+    )?;
 
     let total = paths.len();
 
@@ -247,7 +245,7 @@ pub fn run(
             }
         };
         let results: Vec<IndexResult> = meta.into_iter().zip(embeds)
-            .filter(|(_, embed)| embed.len() == EMBED_DIM)
+            .filter(|(_, embed)| embed.len() == model.dims)
             .map(|((path, hash, meta), embed)| IndexResult {
                 path,
                 mtime: mtime_secs(&meta),
@@ -340,7 +338,7 @@ fn rank(
     let threshold = match cutoff {
         CutoffMode::Auto => {
             let mut scores: Vec<f64> = all_scored.iter().map(|(s, _)| *s).collect();
-            adaptive_cutoff(&mut scores)
+            adaptive_cutoff(&mut scores, store.dims())
         }
         CutoffMode::None => 0.0,
         CutoffMode::Fixed(t) => *t,
@@ -471,7 +469,7 @@ mod tests {
     use super::*;
 
     fn unit(dims: &[(usize, f32)]) -> Vec<f32> {
-        let mut v = vec![0f32; EMBED_DIM];
+        let mut v = vec![0f32; 768];
         for &(i, x) in dims { v[i] = x; }
         crate::backends::l2_normalize(&mut v);
         v
@@ -495,7 +493,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut db = Database::open(&dir).unwrap();
-        let mut store = VectorStore::open(&dir).unwrap();
+        let mut store = VectorStore::open(&dir, 768).unwrap();
         store.reserve(700).unwrap();
         let mut add = |path: &str, v: &[f32]| {
             let off = store.append_f32(v).unwrap();

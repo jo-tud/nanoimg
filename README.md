@@ -49,9 +49,25 @@ Everything else is hand-rolled.
 
 ## How it works
 
-Images are embedded with [SigLIP2](https://huggingface.co/google/siglip2-base-patch16-224)
-and searched by cosine similarity against your text query. Models download automatically on
-first run (~1.5 GB to `~/.nanoimg/models/`). Results stream live as batches finish indexing.
+Images are embedded with [SigLIP2](https://huggingface.co/blog/siglip2)
+and searched by cosine similarity against your text query. Queries work in many languages
+("Hund im Schnee" as well as "dog in snow"). Models download automatically on first use
+to `~/.nanoimg/models/`. Results stream live as batches finish indexing.
+
+Three model sizes, picked with `--model` (or `NANOIMG_MODEL`):
+
+| Model | Resolution | Dims | Download | Notes |
+|---|---|---|---|---|
+| `base` (default) | 224 | 768 | 1.5 GB | fastest |
+| `large` | 256 | 1024 | 1.8 GB | fp16 weights, noticeably better matches |
+| `so400m` | 384 | 1152 | 2.3 GB | fp16 weights, best quality, slowest to index |
+
+```
+nanoimg -m large ~/photos "Hochzeit im Garten"
+export NANOIMG_MODEL=large    # make it the default
+```
+
+Each model keeps its own index, so switching re-indexes once.
 
 ## Build
 
@@ -77,17 +93,20 @@ Everything lives in `~/.nanoimg/`:
 
 ```
 ~/.nanoimg/
-├── models/              # ONNX models + tokenizer (~1.5 GB, downloaded on first run)
-│   ├── siglip2_image.onnx
-│   ├── siglip2_text.onnx
-│   └── tokenizer.json
-├── index.dat            # image metadata (paths, hashes, vector offsets)
-├── vectors_f32.bin      # raw 768-dim f32 embeddings
-└── vectors.usearch      # HNSW approximate nearest-neighbor index
+├── models/              # ONNX models + tokenizer, downloaded on first use
+│   ├── siglip2_image.onnx, siglip2_text.onnx                   # base
+│   ├── siglip2-large_{image,text}_fp16.onnx                     # large
+│   ├── siglip2-so400m_{image,text}_fp16.onnx                    # so400m
+│   └── tokenizer.json                                           # shared
+├── index.dat            # base index: image metadata (paths, hashes, vector offsets)
+├── vectors_f32.bin      #             raw f32 embeddings
+├── vectors.usearch      #             HNSW approximate nearest-neighbor index
+├── large/               # same three files for --model large
+└── so400m/              # same three files for --model so400m
 ```
 
 ```
-nanoimg --reindex   # clear the index (keeps models)
+nanoimg --reindex   # clear the current model's index (keeps models)
 rm -rf ~/.nanoimg   # delete everything including models
 ```
 

@@ -47,3 +47,16 @@ Text model now always runs on the CPU, with weights read zero-copy from the mapp
 |---|---|---|
 | v0.3 — text model copied to RAM and uploaded to GPU | 1.36 s | 2.2 GB |
 | v0.4 — CPU, zero-copy mmap | 0.58 s | 0.74 GB |
+
+## Model sizes (v0.4)
+
+256 camera JPEGs, RTX 4070 Laptop GPU. Query = text embedding on CPU + search.
+
+| Model | Index 256 photos | Images/s | Peak VRAM | Query | Query RSS |
+|---|---|---|---|---|---|
+| `base` (f32) | 26.4 s | 9.7 | 2.1 GB | 0.62 s | 0.74 GB |
+| `large` (fp16 → f32) | 86.6 s | 3.0 | 2.7 GB | 1.48 s | 1.84 GB |
+| `so400m` (fp16 → f32) | 293.4 s | 0.9 | 4.5 GB | 1.74 s | 2.49 GB |
+
+fp16 weights are widened to f32 on first use; token-embedding rows are widened
+per query only (saves ~1 GB RSS for large/so400m).

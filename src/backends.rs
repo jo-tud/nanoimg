@@ -30,12 +30,17 @@ pub fn l2_normalize(v: &mut Vec<f32>) {
 
 pub struct SigLIP2ImageEmbedder {
     model: OnnxModel,
+    /// Square input resolution the vision tower was trained at
+    size: usize,
     #[cfg(feature = "gpu")]
     gpu: Option<std::sync::Mutex<crate::gpu::GpuExecutor>>,
+    /// Images per GPU forward pass
+    #[cfg(feature = "gpu")]
+    gpu_batch: usize,
 }
 
 impl SigLIP2ImageEmbedder {
-    pub fn load(model_path: &Path) -> Result<Self> {
+    pub fn load(model_path: &Path, size: usize, #[allow(unused)] gpu_batch: usize) -> Result<Self> {
         let model = OnnxModel::load(model_path)
             .context("load siglip2 image model")?;
 
@@ -51,29 +56,29 @@ impl SigLIP2ImageEmbedder {
 
         Ok(Self {
             model,
+            size,
             #[cfg(feature = "gpu")]
             gpu,
+            #[cfg(feature = "gpu")]
+            gpu_batch: gpu_batch.max(1),
         })
     }
 
-    fn preprocess(img: &DynamicImage) -> Vec<f32> {
+    /// Squash to size×size (no crop, as the SigLIP2 processor does), scale to [-1, 1], CHW.
+    fn preprocess(&self, img: &DynamicImage) -> Vec<f32> {
         use image::imageops::FilterType;
-        let rgb = img.resize_exact(224, 224, FilterType::Triangle).to_rgb8();
-        let mut chw = vec![0f32; 3 * 224 * 224];
+        let n = self.size;
+        let rgb = img.resize_exact(n as u32, n as u32, FilterType::Triangle).to_rgb8();
+        let mut chw = vec![0f32; 3 * n * n];
         for (x, y, pixel) in rgb.enumerate_pixels() {
             for c in 0..3 {
-                chw[c * 224 * 224 + y as usize * 224 + x as usize] =
+                chw[c * n * n + y as usize * n + x as usize] =
                     (pixel.0[c] as f32 / 255.0 - 0.5) / 0.5;
             }
         }
         chw
     }
 }
-
-/// Images per GPU forward pass. Activations for one image are ~50 MB, so this
-/// stays well within a few GB of VRAM while keeping the GPU saturated.
-#[cfg(feature = "gpu")]
-const GPU_BATCH: usize = 32;
 
 fn pooled_embeddings(outputs: &std::collections::HashMap<String, Tensor>) -> Result<Vec<Vec<f32>>> {
     let pooler = outputs.get("pooler_output").context("missing pooler_output")?;
@@ -90,9 +95,9 @@ impl Embedder for SigLIP2ImageEmbedder {
         #[cfg(feature = "gpu")]
         if let Some(ref gpu) = self.gpu {
             let mut out = Vec::with_capacity(imgs.len());
-            for batch in imgs.chunks(GPU_BATCH) {
-                let pixels: Vec<f32> = batch.par_iter().flat_map_iter(Self::preprocess).collect();
-                let input = Tensor::f32(vec![batch.len(), 3, 224, 224], pixels);
+            for batch in imgs.chunks(self.gpu_batch) {
+                let pixels: Vec<f32> = batch.par_iter().flat_map_iter(|img| self.preprocess(img)).collect();
+                let input = Tensor::f32(vec![batch.len(), 3, self.size, self.size], pixels);
                 let outputs = gpu.lock().unwrap().run(&self.model, vec![("pixel_values", input)])
                     .context("gpu run image model")?;
                 out.extend(pooled_embeddings(&outputs)?);
@@ -102,7 +107,7 @@ impl Embedder for SigLIP2ImageEmbedder {
 
         // CPU: one image per rayon task keeps every core busy with small GEMMs
         imgs.par_iter().map(|img| {
-            let input = Tensor::f32(vec![1, 3, 224, 224], Self::preprocess(img));
+            let input = Tensor::f32(vec![1, 3, self.size, self.size], self.preprocess(img));
             let outputs = onnx::run(&self.model, vec![("pixel_values", input)])
                 .context("run image model")?;
             Ok(pooled_embeddings(&outputs)?.remove(0))
@@ -158,7 +163,7 @@ mod bench {
     #[ignore]
     fn bench_image_embed() {
         let dir = model_dir();
-        let embedder = SigLIP2ImageEmbedder::load(&dir.join("siglip2_image.onnx"))
+        let embedder = SigLIP2ImageEmbedder::load(&dir.join("siglip2_image.onnx"), 224, 1)
             .expect("load image model");
         let img = DynamicImage::from(image::RgbImage::new(224, 224));
         let n = 10;

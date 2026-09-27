@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use memmap2::{Mmap, MmapOptions};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::shape::*;
 
@@ -50,6 +50,48 @@ pub enum TData {
     /// f32 weights borrowed from the mapped model file: (map, byte offset, element count).
     /// The offset is 4-byte aligned (checked at load).
     F32Mapped(Arc<Mmap>, usize, usize),
+    /// fp16 weights left in the mapped file, widened to f32 on first full use.
+    /// Gather reads single rows without converting the rest (token embedding tables).
+    F16Mapped(Arc<F16Data>),
+}
+
+pub struct F16Data {
+    map: Arc<Mmap>,
+    off: usize,
+    len: usize,
+    widened: OnceLock<Vec<f32>>,
+}
+
+impl F16Data {
+    /// Widen elements `start..start + out.len()` into `out`.
+    pub fn widen_range(&self, start: usize, out: &mut [f32]) {
+        let bytes = &self.map[self.off + start * 2..self.off + (start + out.len()) * 2];
+        for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+            *o = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        }
+    }
+
+    fn widen_all(&self) -> Vec<f32> {
+        let mut v = vec![0f32; self.len];
+        self.widen_range(0, &mut v);
+        v
+    }
+}
+
+/// IEEE 754 half → single precision.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x3ff) as u32;
+    match exp {
+        0 => {
+            // zero / subnormal: mant · 2⁻²⁴
+            let v = mant as f32 * (1.0 / 16_777_216.0);
+            if sign != 0 { -v } else { v }
+        }
+        31 => f32::from_bits(sign | 0x7f80_0000 | (mant << 13)), // inf / NaN
+        _ => f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13)),
+    }
 }
 
 impl Tensor {
@@ -67,7 +109,17 @@ impl Tensor {
             TData::F32Mapped(map, off, len) => unsafe {
                 std::slice::from_raw_parts(map.as_ptr().add(*off) as *const f32, *len)
             },
-            _ => panic!("expected f32"),
+            TData::F16Mapped(d) => d.widened.get_or_init(|| d.widen_all()),
+            TData::I64(_) => panic!("expected f32"),
+        }
+    }
+    /// f32 view without caching a widened copy of fp16 data (for one-off uploads).
+    #[cfg(feature = "gpu")]
+    pub fn f32_data(&self) -> std::borrow::Cow<'_, [f32]> {
+        use std::borrow::Cow;
+        match &self.data {
+            TData::F16Mapped(d) if d.widened.get().is_none() => Cow::Owned(d.widen_all()),
+            _ => Cow::Borrowed(self.as_f32()),
         }
     }
     pub fn as_i64(&self) -> &[i64] {
@@ -357,6 +409,15 @@ impl OnnxModel {
                             .collect();
                         Tensor::f32(raw.dims, data)
                     }
+                    10 => Tensor {
+                        shape: raw.dims,
+                        data: TData::F16Mapped(Arc::new(F16Data {
+                            map: mmap.clone(),
+                            off: raw.raw_data_offset,
+                            len: raw.raw_data_len / 2,
+                            widened: OnceLock::new(),
+                        })),
+                    },
                     7 => {
                         let data: Vec<i64> = bytes.chunks_exact(8)
                             .map(|b| i64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]))
@@ -365,6 +426,8 @@ impl OnnxModel {
                     }
                     dt => bail!("unsupported data type {} in initializer {}", dt, raw.name),
                 }
+            } else if raw.data_type == 10 {
+                bail!("fp16 initializer {} without raw_data is not supported", raw.name);
             } else if !raw.float_data.is_empty() {
                 Tensor::f32(raw.dims, raw.float_data)
             } else if !raw.int64_data.is_empty() {
@@ -837,7 +900,19 @@ fn op_gather(data: &Tensor, indices: &Tensor, axis: i64) -> Tensor {
     let idx_count: usize = indices.shape.iter().product::<usize>().max(1);
 
     match &data.data {
-        TData::F32(_) | TData::F32Mapped(..) => {
+        TData::F16Mapped(d) if d.widened.get().is_none() => {
+            // Widen only the gathered rows (a query needs 64 rows of a 256k-row table)
+            let mut out = vec![0f32; out_shape.iter().product::<usize>().max(1)];
+            for o in 0..outer {
+                for (ip, &iv) in idx.iter().enumerate() {
+                    let i = if iv < 0 { axis_size as i64 + iv } else { iv } as usize;
+                    let dst = (o * idx_count + ip) * inner;
+                    d.widen_range((o * axis_size + i) * inner, &mut out[dst..dst + inner]);
+                }
+            }
+            Tensor::f32(out_shape, out)
+        }
+        TData::F32(_) | TData::F32Mapped(..) | TData::F16Mapped(_) => {
             let dv = data.as_f32();
             let mut out = vec![0f32; out_shape.iter().product::<usize>().max(1)];
             for o in 0..outer {
@@ -891,6 +966,24 @@ fn op_tile(data: &Tensor, repeats: &Tensor) -> Tensor {
         out[i] = in_data[in_idx];
     }
     Tensor::f32(out_shape, out)
+}
+
+/// Cast between the types this runtime keeps. All float math runs in f32, so the
+/// FLOAT16 casts at the edges of fp16 graphs are identities.
+pub fn op_cast(data: &Tensor, node: &Node) -> Result<Tensor> {
+    check_cast(node, data.is_f32())?;
+    Ok(data.clone())
+}
+
+/// Ok if casting a float (or int64) tensor per `node` is an identity here.
+pub fn check_cast(node: &Node, is_float: bool) -> Result<()> {
+    const FLOAT: i64 = 1;
+    const INT64: i64 = 7;
+    const FLOAT16: i64 = 10;
+    match (node.attr_i("to"), is_float) {
+        (Some(FLOAT | FLOAT16), true) | (Some(INT64), false) => Ok(()),
+        (to, _) => bail!("unsupported Cast to {:?}", to),
+    }
 }
 
 // ── Graph executor ───────────────────────────────────────────────────────────
@@ -991,6 +1084,7 @@ fn exec_node(
         "Gather" => op_gather(inp(0), inp(1), node.attr_i("axis").unwrap_or(0)),
         "Shape" => op_shape(inp(0)),
         "Tile" => op_tile(inp(0), inp(1)),
+        "Cast" => op_cast(inp(0), node)?,
         _ => bail!("unsupported op: {}", node.op_type),
     };
 
@@ -1060,4 +1154,51 @@ pub fn cpu_squeeze(data: &Tensor, axes: Option<&Tensor>) -> Tensor {
 #[cfg(feature = "gpu")]
 pub fn cpu_reshape(data: &Tensor, shape: &Tensor) -> Tensor {
     op_reshape(data, shape)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_conversion() {
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0xc000), -2.0);
+        assert_eq!(f16_to_f32(0x3555), 0.333_251_95); // nearest half to 1/3
+        assert_eq!(f16_to_f32(0x7bff), 65504.0); // max normal
+        assert_eq!(f16_to_f32(0x0001), 5.960_464_5e-8); // min subnormal
+        assert_eq!(f16_to_f32(0x8001), -5.960_464_5e-8);
+        assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);
+        assert!(f16_to_f32(0x7e00).is_nan());
+    }
+
+    /// Row-wise fp16 Gather (used for token embeddings) must match full widening.
+    #[test]
+    fn f16_gather_matches_widened() {
+        let path = std::env::temp_dir().join(format!("nanoimg_f16_{}", std::process::id()));
+        // 1 pad byte so the table starts unaligned, like real fp16 initializers can
+        let halves: Vec<u16> = (0..12u16).map(|i| 0x3c00 + i * 0x80).collect(); // 1.0, 1.125, ...
+        let mut bytes = vec![0u8];
+        bytes.extend(halves.iter().flat_map(|h| h.to_le_bytes()));
+        std::fs::write(&path, &bytes).unwrap();
+        let map = Arc::new(unsafe { MmapOptions::new().map(&std::fs::File::open(&path).unwrap()).unwrap() });
+        let table = || Tensor {
+            shape: vec![4, 3],
+            data: TData::F16Mapped(Arc::new(F16Data { map: map.clone(), off: 1, len: 12, widened: OnceLock::new() })),
+        };
+        let idx = Tensor::i64(vec![2], vec![2, -4]); // row 2 and row 0 (negative index)
+
+        let lazy = table();
+        let rows = op_gather(&lazy, &idx, 0);
+        assert!(matches!(&lazy.data, TData::F16Mapped(d) if d.widened.get().is_none()), "gather widened whole table");
+
+        let full = table();
+        full.as_f32(); // force widening → generic path
+        let expect = op_gather(&full, &idx, 0);
+        assert_eq!(rows.shape, vec![2, 3]);
+        assert_eq!(rows.as_f32(), expect.as_f32());
+        assert_eq!(rows.as_f32(), &[1.75, 1.875, 2.0, 1.0, 1.125, 1.25]);
+        std::fs::remove_file(&path).ok();
+    }
 }

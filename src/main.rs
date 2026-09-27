@@ -54,6 +54,15 @@ struct Cli {
     /// Print scores alongside paths
     #[arg(short = 's', long)]
     scores: bool,
+
+    /// Embedding model; each keeps its own index
+    #[arg(short = 'm', long, env = "NANOIMG_MODEL", default_value = "base", value_parser = model_names())]
+    model: String,
+}
+
+fn model_names() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(models::MODELS.iter()
+        .map(|m| clap::builder::PossibleValue::new(m.name).help(m.summary)))
 }
 
 fn main() -> ExitCode {
@@ -72,13 +81,15 @@ fn main() -> ExitCode {
 /// Returns Ok(true) if results were found (or no query), Ok(false) if query matched nothing.
 fn run() -> anyhow::Result<bool> {
     let cli = Cli::parse();
+    let model = models::find(&cli.model)?;
     let data_dir = data_dir()?;
-    std::fs::create_dir_all(&data_dir)?;
+    let index_dir = model.index_dir(&data_dir);
+    std::fs::create_dir_all(&index_dir)?;
 
     if cli.reindex {
         for name in &["index.dat", "vectors_f32.bin", "vectors.usearch",
                       "index.db", "index.db-wal", "index.db-shm", "source_dir"] {
-            let p = data_dir.join(name);
+            let p = index_dir.join(name);
             if p.exists() { std::fs::remove_file(&p)?; }
         }
         if cli.dir.is_none() {
@@ -116,14 +127,13 @@ fn run() -> anyhow::Result<bool> {
         anyhow::bail!("not a directory: {}", dir.display());
     }
 
-    models::ensure_ready(&data_dir)?;
+    models::ensure_ready(&data_dir, model)?;
 
     // Embed query up front so results appear as soon as first batch is indexed
     let query_vec = if let Some(ref q) = cli.query {
-        let model_dir = data_dir.join("models");
         let embedder = backends::SigLIP2TextEmbedder::load(
-            &model_dir.join("siglip2_text.onnx"),
-            &model_dir.join("tokenizer.json"),
+            &model.text_model(&data_dir),
+            &models::Model::tokenizer(&data_dir),
         )?;
         Some(embedder.embed_text(q)?)
     } else {
@@ -141,11 +151,11 @@ fn run() -> anyhow::Result<bool> {
         }
     };
 
-    let db = db::Database::open(&data_dir)?;
-    let store = store::VectorStore::open(&data_dir)?;
+    let db = db::Database::open(&index_dir)?;
+    let store = store::VectorStore::open(&index_dir, model.dims)?;
     let results = index::run(
-        dir, !cli.reindex, query_vec.as_deref(), cli.limit, db, store, &data_dir, cli.quiet,
-        &cutoff,
+        dir, !cli.reindex, query_vec.as_deref(), cli.limit, db, store, &data_dir, model,
+        cli.quiet, &cutoff,
     )?;
 
     // Print results to stdout
