@@ -465,7 +465,7 @@ fn binary_op(a: &Tensor, b: &Tensor, f: fn(f32, f32) -> f32) -> Tensor {
     }
     // Fast path: inner broadcast (LayerNorm γ/β, e.g. [1,197,768] op [768])
     let inner = *a.shape.last().unwrap_or(&0);
-    if bd.len() == inner && inner > 0 && ad.len() % inner == 0 {
+    if bd.len() == inner && inner > 0 && ad.len().is_multiple_of(inner) {
         let out_shape = broadcast_shape(&a.shape, &b.shape);
         return Tensor::f32(out_shape,
             ad.chunks_exact(inner)
@@ -852,7 +852,7 @@ fn op_slice(data: &Tensor, starts: &Tensor, ends: &Tensor,
         s = s.clamp(0, dim);
         e = e.clamp(0, dim);
         if e > dim { e = dim; }
-        let len = if e > s { ((e - s) as usize + step - 1) / step } else { 0 };
+        let len = if e > s { ((e - s) as usize).div_ceil(step) } else { 0 };
         slice_start[axis] = s as usize;
         slice_step[axis] = step;
         out_shape[axis] = len;
@@ -1077,7 +1077,7 @@ fn exec_node(
         "Unsqueeze" => op_unsqueeze(inp(0), inp(1)),
         "Squeeze" => op_squeeze(inp(0), get(1)),
         "Concat" => {
-            let ts: Vec<&Tensor> = (0..node.inputs.len()).filter_map(|i| get(i)).collect();
+            let ts: Vec<&Tensor> = (0..node.inputs.len()).filter_map(&get).collect();
             op_concat(&ts, node.attr_i("axis").unwrap_or(0))
         }
         "Slice" => op_slice(inp(0), inp(1), inp(2), get(3), get(4)),

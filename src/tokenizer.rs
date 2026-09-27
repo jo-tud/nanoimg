@@ -40,9 +40,9 @@ impl BpeTokenizer {
             }
         }
 
-        let pad_id = vocab.get(&b"<pad>"[..].to_vec()).copied().unwrap_or(0);
-        let unk_id = vocab.get(&b"<unk>"[..].to_vec()).copied().unwrap_or(3);
-        let eos_id = vocab.get(&b"<eos>"[..].to_vec()).copied();
+        let pad_id = vocab.get(b"<pad>".as_slice()).copied().unwrap_or(0);
+        let unk_id = vocab.get(b"<unk>".as_slice()).copied().unwrap_or(3);
+        let eos_id = vocab.get(b"<eos>".as_slice()).copied();
         let byte_ids: Vec<Option<u32>> = (0..256)
             .map(|b| vocab.get(format!("<0x{b:02X}>").as_bytes()).copied())
             .collect();
@@ -81,11 +81,11 @@ impl BpeTokenizer {
             let mut best_rank = u32::MAX;
             let mut best_pos = 0;
             for i in 0..ids.len() - 1 {
-                if let Some(&rank) = self.merge_rank.get(&(ids[i], ids[i + 1])) {
-                    if rank < best_rank {
-                        best_rank = rank;
-                        best_pos = i;
-                    }
+                if let Some(&rank) = self.merge_rank.get(&(ids[i], ids[i + 1]))
+                    && rank < best_rank
+                {
+                    best_rank = rank;
+                    best_pos = i;
                 }
             }
             if best_rank == u32::MAX { break; }
@@ -233,7 +233,10 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-fn parse_tokenizer_json(data: &[u8]) -> Result<(Vec<(Vec<u8>, u32)>, Vec<(Vec<u8>, Vec<u8>)>)> {
+/// (token bytes, id) pairs and (left, right) merge pairs in rank order.
+type VocabAndMerges = (Vec<(Vec<u8>, u32)>, Vec<(Vec<u8>, Vec<u8>)>);
+
+fn parse_tokenizer_json(data: &[u8]) -> Result<VocabAndMerges> {
     let mut p = JsonParser { data, pos: 0 };
     let mut vocab = Vec::new();
     let mut merges = Vec::new();

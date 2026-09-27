@@ -725,7 +725,7 @@ impl GpuExecutor {
         }
     }
 
-    fn div_ceil(a: u32, b: u32) -> u32 { (a + b - 1) / b }
+    fn div_ceil(a: u32, b: u32) -> u32 { a.div_ceil(b) }
 
     /// Workgroup grid for `threads` invocations of a 256-wide 1D shader. Each
     /// dimension is capped at 65535 groups, so large tensors spill into y.
@@ -768,9 +768,9 @@ impl GpuExecutor {
         // Batch strides: 0 if that operand has no batch dims (broadcast)
         let a_batch_elems: usize = a_batch.iter().product::<usize>().max(1);
         let b_batch_elems: usize = b_batch.iter().product::<usize>().max(1);
-        let a_batch_stride = if a_batch_elems > 1 { (m * k) as u32 } else { 0 };
-        let b_batch_stride = if b_batch_elems > 1 { (k * n) as u32 } else { 0 };
-        let c_batch_stride = (m * n) as u32;
+        let a_batch_stride = if a_batch_elems > 1 { m * k } else { 0 };
+        let b_batch_stride = if b_batch_elems > 1 { k * n } else { 0 };
+        let c_batch_stride = m * n;
         let out_len = (batch * m * n) as usize;
         let out_buf = self.create_storage((out_len * 4) as u64);
 
@@ -1046,7 +1046,7 @@ impl GpuExecutor {
             if e < 0 { e += dim; }
             s = s.clamp(0, dim);
             e = e.clamp(0, dim);
-            let len = if e > s { ((e - s) as u32 + step - 1) / step } else { 0 };
+            let len = if e > s { ((e - s) as u32).div_ceil(step) } else { 0 };
             slice_start[axis] = s as u32;
             slice_step[axis] = step;
             out_shape[axis] = len as usize;
@@ -1286,12 +1286,12 @@ impl GpuExecutor {
                         !name.is_empty() && (cpu_tensors.contains_key(name) || model.weights.get(name).map(|t| !t.is_f32()).unwrap_or(false))
                     });
                     if all_cpu {
-                        let ts: Vec<&Tensor> = (0..node.inputs.len()).filter_map(|j| get_cpu(j)).collect();
+                        let ts: Vec<&Tensor> = (0..node.inputs.len()).filter_map(&get_cpu).collect();
                         let result = crate::onnx::cpu_concat(&ts, axis);
                         cpu_tensors.insert(out_name.clone(), result);
                     } else {
                         let ts: Vec<&GpuTensor> = (0..node.inputs.len())
-                            .filter_map(|j| get_gpu(j))
+                            .filter_map(&get_gpu)
                             .collect();
                         let result = self.op_concat(&ts, axis, &mut enc);
                         gpu_tensors.insert(out_name.clone(), result);
@@ -1420,7 +1420,7 @@ fn bytemuck_cast_slice<T: Copy>(data: &[T]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(
             data.as_ptr() as *const u8,
-            data.len() * std::mem::size_of::<T>(),
+            std::mem::size_of_val(data),
         )
     }
 }

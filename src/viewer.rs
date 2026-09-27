@@ -115,7 +115,7 @@ fn draw_placeholder(buf: &mut [u32], buf_w: usize, buf_h: usize,
     let tx = x + w.saturating_sub(tw) / 2;
     let text_y = y + (h as isize - FONT_H as isize) / 2;
     if text_y >= 0 && (text_y as usize) < buf_h {
-        draw_text(buf, buf_w, tx, text_y as usize, &text, LOAD_FG, LOAD_BG);
+        draw_text(buf, buf_w, tx, text_y as usize, text, LOAD_FG, LOAD_BG);
     }
 }
 
@@ -579,24 +579,24 @@ impl Viewer {
         }
 
         // Mouse click
-        if window.get_mouse_down(MouseButton::Left) {
-            if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
-                let (mx, my) = (mx as usize, my as usize);
-                match self.state {
-                    ViewState::Grid => {
-                        if my < self.viewport_h() {
-                            if let Some(idx) = self.hit_test(mx, my) {
-                                if self.sel == idx {
-                                    // Double-click effect: already selected → fullscreen
-                                    self.state = ViewState::Full;
-                                }
-                                self.sel = idx;
-                                self.dirty = true;
-                            }
+        if window.get_mouse_down(MouseButton::Left)
+            && let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp)
+        {
+            let (mx, my) = (mx as usize, my as usize);
+            match self.state {
+                ViewState::Grid => {
+                    if my < self.viewport_h()
+                        && let Some(idx) = self.hit_test(mx, my)
+                    {
+                        if self.sel == idx {
+                            // Double-click effect: already selected → fullscreen
+                            self.state = ViewState::Full;
                         }
+                        self.sel = idx;
+                        self.dirty = true;
                     }
-                    ViewState::Full => {}
                 }
+                ViewState::Full => {}
             }
         }
 
@@ -671,7 +671,7 @@ impl Viewer {
 fn suppress_stderr<F: FnOnce()>(f: F) {
     unsafe {
         let saved = libc::dup(2);
-        let devnull = libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY);
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
         if devnull >= 0 { libc::dup2(devnull, 2); libc::close(devnull); }
         f();
         if saved >= 0 { libc::dup2(saved, 2); libc::close(saved); }
@@ -710,7 +710,7 @@ pub fn run(results: &[(f64, String)]) -> Result<()> {
 
         // Animate loading placeholders
         viewer.frame = viewer.frame.wrapping_add(1);
-        if viewer.frame % 15 == 0 {
+        if viewer.frame.is_multiple_of(15) {
             let has_loading = match viewer.state {
                 ViewState::Grid => {
                     let (sr, er) = viewer.visible_row_range();

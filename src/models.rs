@@ -151,10 +151,10 @@ pub fn ensure_ready(data_dir: &Path, model: &Model) -> Result<()> {
             .chain([TOKENIZER.filename])
             .collect();
         for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if !known.contains(name) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+            if let Some(name) = entry.file_name().to_str()
+                && !known.contains(name)
+            {
+                let _ = std::fs::remove_file(entry.path());
             }
         }
     }

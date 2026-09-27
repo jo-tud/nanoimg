@@ -84,11 +84,11 @@ pub fn run(
         .filter(|p| {
             if !update { return true; }
             let path_str = p.to_string_lossy().to_string();
-            if let Some((stored_mtime, stored_size)) = db.get_mtime_size(&path_str) {
-                if let Ok(meta) = std::fs::metadata(p) {
-                    return mtime_secs(&meta) != stored_mtime
-                        || meta.len() as i64 != stored_size;
-                }
+            if let Some((stored_mtime, stored_size)) = db.get_mtime_size(&path_str)
+                && let Ok(meta) = std::fs::metadata(p)
+            {
+                return mtime_secs(&meta) != stored_mtime
+                    || meta.len() as i64 != stored_size;
             }
             true
         })
@@ -445,7 +445,7 @@ mod tests {
         let hits = rank(&q, 0, "/b/", &db, &store, -1.0);
         assert_eq!(hits.len(), 1, "expected /b/only.jpg, got {hits:?}");
         assert_eq!(hits[0].1, "/b/only.jpg");
-        assert!((hits[0].0 - 0.7071).abs() < 1e-3, "score {}", hits[0].0);
+        assert!((hits[0].0 - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-3, "score {}", hits[0].0);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

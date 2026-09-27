@@ -72,7 +72,7 @@ Each model keeps its own index, so switching re-indexes once.
 
 ## Build
 
-Linux x86_64. No BLAS to install — matmul is pure Rust:
+Linux x86_64, Rust 1.90+. No BLAS to install — matmul is pure Rust:
 
 ```
 cargo build --release                          # CPU + GPU (Vulkan/Metal/DX12 via wgpu)

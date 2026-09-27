@@ -19,7 +19,7 @@ pub trait TextEmbedder: Send + Sync {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-pub fn l2_normalize(v: &mut Vec<f32>) {
+pub fn l2_normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-6 {
         for x in v.iter_mut() { *x /= norm; }

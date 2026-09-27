@@ -312,7 +312,7 @@ mod tests {
                 let id = db.insert_image(
                     &format!("/img/{i}.jpg"), i, i * 10, i as u64 * 100, &format!("h{i}"),
                 ).unwrap();
-                assert_eq!(id, (i + 1) as i64);
+                assert_eq!(id, i + 1);
             }
             db.commit().unwrap();
         }

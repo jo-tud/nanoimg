@@ -1,7 +1,8 @@
 [package]
 name        = "nanoimg"
 version     = "0.3.0"
-edition     = "2021"
+edition     = "2024"
+rust-version = "1.90"
 description = "Semantic image search in ~2400 lines of from-scratch Rust"
 license     = "MIT"
 readme      = "README.md"
@@ -11,6 +12,12 @@ categories  = ["multimedia::images", "command-line-utilities"]
 [[bin]]
 name = "nanoimg"
 path = "src/main.rs"
+
+[lints.clippy]
+# Numeric kernels index several arrays in lockstep; iterators would obscure them
+needless_range_loop = "allow"
+# Hot-path helpers take plain dimensions/buffers rather than ad-hoc structs
+too_many_arguments = "allow"
 
 [features]
 default = ["gpu"]

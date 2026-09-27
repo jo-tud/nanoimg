@@ -104,8 +104,12 @@ fn run() -> anyhow::Result<bool> {
         && (cli.dir.is_none() || cli.dir.as_ref().map(|d| d.as_os_str() == "-").unwrap_or(false));
 
     if use_stdin {
-        let paths: Vec<String> = std::io::stdin().lock().lines()
-            .filter_map(|l| l.ok())
+        // Stop at the first read error (lines().filter_map(ok) spun forever on a
+        // persistent one); skip lines that aren't UTF-8, as before
+        let paths: Vec<String> = std::io::stdin().lock().split(b'\n')
+            .map_while(Result::ok)
+            .filter_map(|l| String::from_utf8(l).ok())
+            .map(|l| l.trim_end_matches('\r').to_string())
             .filter(|l| !l.is_empty())
             .collect();
         if paths.is_empty() {

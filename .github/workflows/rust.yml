@@ -8,20 +8,51 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
-  build:
-
+  test:
+    name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gpu
+            flags: ""
+          - name: cpu-only
+            flags: --no-default-features
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - name: Install build dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y libx11-dev libxcursor-dev \
           libxrandr-dev libxinerama-dev libxi-dev libgl-dev
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.name }}
+    - name: Clippy
+      run: cargo clippy --locked --all-targets ${{ matrix.flags }}
+    # Model-dependent tests are #[ignore]d (they need ~1.5 GB of models)
+    - name: Test
+      run: cargo test --locked ${{ matrix.flags }}
+
+  msrv:
+    name: MSRV (1.90)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libx11-dev libxcursor-dev \
+          libxrandr-dev libxinerama-dev libxi-dev libgl-dev
+    - uses: dtolnay/rust-toolchain@1.90
+    - uses: Swatinem/rust-cache@v2
+    - name: Check
+      run: cargo check --locked --all-targets
