@@ -19,7 +19,7 @@ jobs:
     - name: Install build dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libopenblas-dev libx11-dev libxcursor-dev \
+        sudo apt-get install -y libx11-dev libxcursor-dev \
           libxrandr-dev libxinerama-dev libxi-dev libgl-dev
     - name: Build
       run: cargo build --verbose

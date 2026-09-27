@@ -91,10 +91,43 @@ pub fn run(
     let live = !quiet && std::io::stderr().is_terminal();
     let color = live && std::env::var_os("NO_COLOR").is_none();
 
+    // Bring the ANN index in line with the database. Records are committed per
+    // chunk but the ANN index is only saved at the end, so an interrupted run
+    // (Ctrl-C) leaves records without vectors — re-add them from vectors_f32.bin.
+    let (live_entries, removed_ids) = db.entries();
+    let mut repaired = 0usize;
+    for (id, offset) in live_entries {
+        if !store.usearch.contains(id) {
+            match store.read_f32(offset) {
+                Ok(v) => store.upsert(id, &v)?,
+                // Vector lost (e.g. crash before it hit disk): forget the record
+                // so the file counts as new and gets re-embedded below.
+                Err(_) => {
+                    if let Ok(path) = db.get_path_by_image_id(id as i64) {
+                        db.remove_path(&path);
+                    }
+                }
+            }
+            repaired += 1;
+        }
+    }
+    for id in removed_ids {
+        if store.usearch.contains(id) {
+            store.remove(id)?;
+            repaired += 1;
+        }
+    }
+    let mut store_dirty = repaired > 0;
+    if repaired > 0 {
+        db.commit()?;
+        if live { eprintln!("Repaired {} index entries.", repaired); }
+    }
+
     let mut all_files = Vec::new();
     walk_files(&dir, &mut all_files);
 
-    let paths: Vec<(PathBuf, String)> = all_files.into_iter()
+    // New or changed files (by mtime/size), with their content hash
+    let changed: Vec<(PathBuf, String)> = all_files.iter()
         .filter(|p| {
             p.extension()
                 .and_then(|s| s.to_str())
@@ -113,34 +146,59 @@ pub fn run(
             true
         })
         .filter_map(|p| {
-            let hash = quick_hash(&p)?;
-            if db.has_hash(&hash) { return None; }
-            Some((p, hash))
+            let hash = quick_hash(p)?;
+            Some((p.clone(), hash))
         })
         .collect();
 
+    // Content we have embedded before (copies, moves, touched files) reuses its vector
+    let (reuse, mut paths): (Vec<_>, Vec<_>) = changed.into_iter()
+        .partition(|(_, hash)| db.vec_offset_for_hash(hash).is_some());
+
+    store.reserve(store.usearch.size() + reuse.len() + paths.len())?;
+
+    if !reuse.is_empty() {
+        db.begin()?;
+        for (path, hash) in reuse {
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            let offset = db.vec_offset_for_hash(&hash).expect("partitioned on hash");
+            let Ok(embed) = store.read_f32(offset) else {
+                paths.push((path, hash)); // stored vector unreadable → embed again
+                continue;
+            };
+            let image_id = db.insert_image(
+                &path.to_string_lossy(), mtime_secs(&meta), meta.len() as i64, offset, &hash,
+            )?;
+            store.upsert(image_id as u64, &embed)?;
+        }
+        db.commit()?;
+        store_dirty = true;
+    }
+
     // Remove stale entries (files deleted from disk)
     if update {
-        let mut disk_files = Vec::new();
-        walk_files(&dir, &mut disk_files);
-        let disk_paths: std::collections::HashSet<String> = disk_files.into_iter()
+        let disk_paths: std::collections::HashSet<String> = all_files.iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let mut removed = 0;
         for stored in db.paths_with_prefix(&dir_prefix) {
             if !disk_paths.contains(&stored) {
-                db.remove_path(&stored);
+                if let Some(id) = db.remove_path(&stored) {
+                    store.remove(id)?;
+                }
                 removed += 1;
             }
         }
         if removed > 0 {
             db.commit()?;
+            store_dirty = true;
             if live { eprintln!("Removed {} stale entries.", removed); }
         }
     }
 
-    // Nothing to index — just search
+    // Nothing to embed — just search
     if paths.is_empty() {
+        if store_dirty { store.save()?; }
         return Ok(query_vec.map(|qv| rank(qv, limit, &dir_prefix, &db, &store, cutoff)).unwrap_or_default());
     }
 
@@ -151,7 +209,6 @@ pub fn run(
     let embedder = crate::backends::SigLIP2ImageEmbedder::load(&img_model)?;
 
     let total = paths.len();
-    store.reserve(store.usearch.size() + total)?;
 
     let mut indexed = 0usize;
     let mut prev_lines = 0usize;
@@ -162,7 +219,7 @@ pub fn run(
             .par_iter()
             .filter_map(|(path, hash)| {
                 let meta = std::fs::metadata(path).ok()?;
-                let img = image::open(path)
+                let img = open_oriented(path)
                     .map_err(|e| eprintln!("skip {}: {}", path.display(), e))
                     .ok()?;
                 let img = thumbnail(&img, 1024);
@@ -188,7 +245,7 @@ pub fn run(
             let image_id = db.insert_image(
                 &path_str, r.mtime, r.size, vec_offset, &r.content_hash,
             )?;
-            store.usearch.add(image_id as u64, &r.embed)?;
+            store.upsert(image_id as u64, &r.embed)?;
         }
         db.commit()?;
         indexed += results.len();
@@ -321,16 +378,46 @@ fn clear_lines(n: usize) {
     std::io::stderr().flush().ok();
 }
 
-/// Fast content fingerprint: SHA-256 of file size + first 8KB.
+/// Fast content fingerprint: SHA-256 of file size + first and last 8KB.
 fn quick_hash(path: &Path) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    const BLOCK: u64 = 8192;
     let mut file = std::fs::File::open(path).ok()?;
     let size = file.metadata().ok()?.len();
-    let mut buf = [0u8; 8192];
-    let n = Read::read(&mut file, &mut buf).ok()?;
+    let mut buf = [0u8; BLOCK as usize];
     let mut hasher = Sha256::new();
     hasher.update(size.to_le_bytes());
+    let n = file.read(&mut buf).ok()?;
     hasher.update(&buf[..n]);
+    if size > BLOCK {
+        file.seek(SeekFrom::Start(size.saturating_sub(BLOCK).max(BLOCK))).ok()?;
+        let n = file.read(&mut buf).ok()?;
+        hasher.update(&buf[..n]);
+    }
     Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Decode an image and apply its EXIF orientation (portrait phone photos are
+/// stored sideways with a rotation tag).
+pub fn open_oriented(path: &Path) -> image::ImageResult<image::DynamicImage> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+    let orientation = decoder.orientation()?;
+    let mut img = image::DynamicImage::from_decoder(decoder)?;
+    img.apply_orientation(orientation);
+    Ok(img)
+}
+
+/// Image dimensions as displayed, i.e. after EXIF orientation (header only, no decode).
+pub fn oriented_dimensions(path: &Path) -> image::ImageResult<(u32, u32)> {
+    use image::{metadata::Orientation, ImageDecoder};
+    let mut decoder = image::ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+    let (w, h) = decoder.dimensions();
+    Ok(match decoder.orientation()? {
+        Orientation::Rotate90 | Orientation::Rotate270
+        | Orientation::Rotate90FlipH | Orientation::Rotate270FlipH => (h, w),
+        _ => (w, h),
+    })
 }
 
 fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {

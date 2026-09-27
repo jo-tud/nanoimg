@@ -53,13 +53,13 @@ pub fn ensure_ready(data_dir: &Path) -> Result<()> {
         if already_present(&dest, spec.sha256)? {
             continue;
         }
-        println!("Downloading {}...", spec.filename);
+        eprintln!("Downloading {}...", spec.filename);
         download_with_progress(spec.url, &dest)
             .with_context(|| format!("download {}", spec.filename))?;
         verify_sha256(&dest, spec.sha256, spec.filename)?;
     }
 
-    println!("All models ready.");
+    eprintln!("All models ready.");
     Ok(())
 }
 

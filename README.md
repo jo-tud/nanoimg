@@ -43,7 +43,8 @@ Everything that matters is from scratch:
 | Flat-file database | 300 | rusqlite |
 
 [usearch](https://github.com/unum-cloud/usearch) handles HNSW.
-BLAS handles matmul. GPU backend uses wgpu compute shaders.
+[matrixmultiply](https://github.com/bluss/matrixmultiply) handles matmul (pure Rust, no system BLAS).
+GPU backend uses wgpu compute shaders.
 Everything else is hand-rolled.
 
 ## How it works
@@ -54,12 +55,9 @@ first run (~1.5 GB to `~/.nanoimg/models/`). Results stream live as batches fini
 
 ## Build
 
-Linux x86_64 + OpenBLAS:
+Linux x86_64. No BLAS to install — matmul is pure Rust:
 
 ```
-dnf install openblas-devel    # Fedora/RHEL
-apt install libopenblas-dev   # Debian/Ubuntu
-
 cargo build --release                          # CPU + GPU (Vulkan/Metal/DX12 via wgpu)
 cargo build --release --no-default-features    # CPU only
 ```
@@ -70,7 +68,7 @@ GPU auto-detects at runtime. Falls back to CPU if no GPU found.
 
 ```
 cargo test                              # unit tests (db, vector store)
-cargo test -- --ignored                 # integration tests (downloads models + images, GPU included by default)
+cargo test -- --ignored                 # tokenizer, GPU and integration tests (downloads models + images)
 ```
 
 ## Data

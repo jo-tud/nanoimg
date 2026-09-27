@@ -75,6 +75,18 @@ fn run() -> anyhow::Result<bool> {
     let data_dir = data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
 
+    if cli.reindex {
+        for name in &["index.dat", "vectors_f32.bin", "vectors.usearch",
+                      "index.db", "index.db-wal", "index.db-shm", "source_dir"] {
+            let p = data_dir.join(name);
+            if p.exists() { std::fs::remove_file(&p)?; }
+        }
+        if cli.dir.is_none() {
+            eprintln!("Index cleared.");
+            return Ok(true);
+        }
+    }
+
     // Piped input mode: read image paths from stdin
     let stdin_piped = !std::io::stdin().is_terminal();
     let use_stdin = stdin_piped
@@ -94,18 +106,6 @@ fn run() -> anyhow::Result<bool> {
             viewer::run(&results)?;
         }
         return Ok(true);
-    }
-
-    if cli.reindex {
-        for name in &["index.dat", "vectors_f32.bin", "vectors.usearch",
-                      "index.db", "index.db-wal", "index.db-shm", "source_dir"] {
-            let p = data_dir.join(name);
-            if p.exists() { std::fs::remove_file(&p)?; }
-        }
-        if cli.dir.is_none() {
-            eprintln!("Index cleared.");
-            return Ok(true);
-        }
     }
 
     let dir = cli.dir.ok_or_else(|| {

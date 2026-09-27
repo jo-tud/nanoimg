@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,9 @@ struct Record {
 pub struct Database {
     records: Vec<Record>,
     path_to_id: HashMap<String, usize>,
-    hashes: HashSet<String>,
+    /// Content hash → offset of its embedding in vectors_f32.bin. Entries outlive
+    /// removed records (the vector file is append-only), so moved files reuse them.
+    hash_to_offset: HashMap<String, u64>,
     db_path: PathBuf,
     dirty: bool,
 }
@@ -29,7 +31,7 @@ impl Database {
         let mut db = Self {
             records: Vec::new(),
             path_to_id: HashMap::new(),
-            hashes: HashSet::new(),
+            hash_to_offset: HashMap::new(),
             db_path,
             dirty: false,
         };
@@ -79,9 +81,11 @@ impl Database {
             pos += hash_len;
 
             let idx = self.records.len();
-            self.path_to_id.insert(path.clone(), idx);
+            if !path.is_empty() {
+                self.path_to_id.insert(path.clone(), idx);
+            }
             if !content_hash.is_empty() {
-                self.hashes.insert(content_hash.clone());
+                self.hash_to_offset.insert(content_hash.clone(), vec_offset);
             }
             self.records.push(Record { path, mtime, size, vec_offset, content_hash });
         }
@@ -121,8 +125,20 @@ impl Database {
         Some((r.mtime, r.size))
     }
 
-    pub fn has_hash(&self, hash: &str) -> bool {
-        self.hashes.contains(hash)
+    /// Offset of an already-computed embedding for this content hash, if any.
+    pub fn vec_offset_for_hash(&self, hash: &str) -> Option<u64> {
+        self.hash_to_offset.get(hash).copied()
+    }
+
+    /// (image id, vector offset) for every live record, and ids of removed records.
+    pub fn entries(&self) -> (Vec<(u64, u64)>, Vec<u64>) {
+        let mut live = Vec::new();
+        let mut removed = Vec::new();
+        for (idx, r) in self.records.iter().enumerate() {
+            let id = (idx + 1) as u64;
+            if r.path.is_empty() { removed.push(id) } else { live.push((id, r.vec_offset)) }
+        }
+        (live, removed)
     }
 
     pub fn insert_image(
@@ -135,7 +151,7 @@ impl Database {
             r.size = size;
             r.vec_offset = vec_offset;
             if !content_hash.is_empty() {
-                self.hashes.insert(content_hash.to_string());
+                self.hash_to_offset.insert(content_hash.to_string(), vec_offset);
             }
             r.content_hash = content_hash.to_string();
             Ok((idx + 1) as i64)
@@ -143,7 +159,7 @@ impl Database {
             let idx = self.records.len();
             self.path_to_id.insert(path.to_string(), idx);
             if !content_hash.is_empty() {
-                self.hashes.insert(content_hash.to_string());
+                self.hash_to_offset.insert(content_hash.to_string(), vec_offset);
             }
             self.records.push(Record {
                 path: path.to_string(), mtime, size, vec_offset,
@@ -176,13 +192,13 @@ impl Database {
     }
 
     /// Mark a path as removed (clears its record but preserves indices).
-    pub fn remove_path(&mut self, path: &str) {
-        if let Some(&idx) = self.path_to_id.get(path) {
-            self.records[idx].path.clear();
-            self.records[idx].content_hash.clear();
-            self.path_to_id.remove(path);
-            self.dirty = true;
-        }
+    /// Returns the image id that was removed.
+    pub fn remove_path(&mut self, path: &str) -> Option<u64> {
+        let idx = self.path_to_id.remove(path)?;
+        self.records[idx].path.clear();
+        self.records[idx].content_hash.clear();
+        self.dirty = true;
+        Some((idx + 1) as u64)
     }
 
     pub fn begin(&self) -> Result<()> {
@@ -215,7 +231,7 @@ mod tests {
         let dir = tmp_dir("empty");
         let db = Database::open(&dir).unwrap();
         assert_eq!(db.get_mtime_size("x"), None);
-        assert!(!db.has_hash("x"));
+        assert_eq!(db.vec_offset_for_hash("x"), None);
         assert!(db.get_vec_offset(1).is_err());
         assert!(db.get_path_by_image_id(1).is_err());
         fs::remove_dir_all(&dir).ok();
@@ -230,8 +246,8 @@ mod tests {
         assert_eq!(db.get_mtime_size("/a/b.jpg"), Some((100, 200)));
         assert_eq!(db.get_vec_offset(1).unwrap(), 42);
         assert_eq!(db.get_path_by_image_id(1).unwrap(), "/a/b.jpg");
-        assert!(db.has_hash("h1"));
-        assert!(!db.has_hash("other"));
+        assert_eq!(db.vec_offset_for_hash("h1"), Some(42));
+        assert_eq!(db.vec_offset_for_hash("other"), None);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -244,9 +260,9 @@ mod tests {
         assert_eq!(id1, id2);
         assert_eq!(db.get_mtime_size("/a.jpg"), Some((2, 20)));
         assert_eq!(db.get_vec_offset(1).unwrap(), 99);
-        // old hash is still present (harmless false positive)
-        assert!(db.has_hash("h1"));
-        assert!(db.has_hash("h2"));
+        // old hash still maps to its (still valid) vector
+        assert_eq!(db.vec_offset_for_hash("h1"), Some(0));
+        assert_eq!(db.vec_offset_for_hash("h2"), Some(99));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -266,8 +282,8 @@ mod tests {
         assert_eq!(db.get_path_by_image_id(2).unwrap(), "/y.jpg");
         assert_eq!(db.get_vec_offset(1).unwrap(), 30);
         assert_eq!(db.get_vec_offset(2).unwrap(), 60);
-        assert!(db.has_hash("abc"));
-        assert!(db.has_hash("def"));
+        assert_eq!(db.vec_offset_for_hash("abc"), Some(30));
+        assert_eq!(db.vec_offset_for_hash("def"), Some(60));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -297,8 +313,27 @@ mod tests {
         for i in 0..200i64 {
             assert_eq!(db.get_mtime_size(&format!("/img/{i}.jpg")), Some((i, i * 10)));
             assert_eq!(db.get_vec_offset((i + 1) as u64).unwrap(), i as u64 * 100);
-            assert!(db.has_hash(&format!("h{i}")));
+            assert_eq!(db.vec_offset_for_hash(&format!("h{i}")), Some(i as u64 * 100));
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_path_returns_id_and_survives_reload() {
+        let dir = tmp_dir("remove");
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.insert_image("/a.jpg", 1, 2, 0, "ha").unwrap();
+            db.insert_image("/b.jpg", 3, 4, 3072, "hb").unwrap();
+            assert_eq!(db.remove_path("/a.jpg"), Some(1));
+            assert_eq!(db.remove_path("/a.jpg"), None);
+            // vector stays reusable within this session (e.g. file was moved)
+            assert_eq!(db.vec_offset_for_hash("ha"), Some(0));
+            db.commit().unwrap();
+        }
+        let db = Database::open(&dir).unwrap();
+        assert_eq!(db.get_mtime_size("/a.jpg"), None);
+        assert_eq!(db.entries(), (vec![(2, 3072)], vec![1]));
         fs::remove_dir_all(&dir).ok();
     }
 

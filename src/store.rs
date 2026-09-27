@@ -78,6 +78,26 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Add `v` under `key`, replacing any vector already stored for that key.
+    pub fn upsert(&self, key: u64, v: &[f32]) -> Result<()> {
+        if self.usearch.contains(key) {
+            self.usearch.remove(key).context("usearch remove")?;
+        }
+        if self.usearch.size() >= self.usearch.capacity() {
+            self.reserve((self.usearch.capacity() * 2).max(64))?;
+        }
+        self.usearch.add(key, v).context("usearch add")?;
+        Ok(())
+    }
+
+    /// Remove `key` from the ANN index (no-op if absent).
+    pub fn remove(&self, key: u64) -> Result<()> {
+        if self.usearch.contains(key) {
+            self.usearch.remove(key).context("usearch remove")?;
+        }
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<()> {
         self.usearch
             .save(self.usearch_path.to_str().unwrap())
@@ -130,6 +150,26 @@ mod tests {
         let dir = tmp_dir("oob");
         let store = VectorStore::open(&dir).unwrap();
         assert!(store.read_f32(0).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_replaces_existing_key() {
+        let dir = tmp_dir("upsert");
+        let store = VectorStore::open(&dir).unwrap();
+        let mut a = vec![0f32; 768];
+        a[0] = 1.0;
+        let mut b = vec![0f32; 768];
+        b[1] = 1.0;
+        store.upsert(7, &a).unwrap();
+        store.upsert(7, &b).unwrap(); // used to fail: "Duplicate keys not allowed"
+        assert_eq!(store.usearch.size(), 1);
+        let hits = store.usearch.search(&b, 1).unwrap();
+        assert_eq!(hits.keys, vec![7]);
+        assert!(hits.distances[0] < 1e-4, "stale vector still indexed");
+        store.remove(7).unwrap();
+        store.remove(7).unwrap(); // idempotent
+        assert!(!store.usearch.contains(7));
         std::fs::remove_dir_all(&dir).ok();
     }
 

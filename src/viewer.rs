@@ -221,7 +221,8 @@ struct Item {
 impl Item {
     fn ensure_img(&mut self) {
         if self.img.is_some() { return; }
-        let mut img = image::open(&self.path).unwrap_or_else(|_| DynamicImage::new_rgb8(1, 1));
+        let mut img = crate::index::open_oriented(std::path::Path::new(&self.path))
+            .unwrap_or_else(|_| DynamicImage::new_rgb8(1, 1));
         if img.width() > MAX_DIM || img.height() > MAX_DIM {
             img = img.resize(MAX_DIM, MAX_DIM, FilterType::Triangle);
         }
@@ -231,7 +232,7 @@ impl Item {
 
 fn make_items(results: &[(f64, String)]) -> Vec<Item> {
     results.iter().map(|(score, path)| {
-        let aspect = image::image_dimensions(path)
+        let aspect = crate::index::oriented_dimensions(std::path::Path::new(path))
             .map(|(w, h)| w as f64 / h.max(1) as f64)
             .unwrap_or(1.5);
         Item { path: path.clone(), score: *score, aspect, img: None, thumb: None, full: None }

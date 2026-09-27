@@ -710,7 +710,7 @@ impl GpuExecutor {
             &[&input.buffer, &col_buf, &param_buf],
             (Self::div_ceil(n_patches * patch, 256), 1, 1), enc);
 
-        // Flush so im2col result is available for CPU BLAS
+        // Flush so im2col result is available for CPU GEMM
         self.flush(enc);
 
         let col_data = self.download_f32(&col_buf, col_len);

@@ -130,7 +130,8 @@ impl SigLIP2TextEmbedder {
 
 impl TextEmbedder for SigLIP2TextEmbedder {
     fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        let ids = self.tokenizer.encode(text, 64);
+        // SigLIP2 was trained on lowercased text
+        let ids = self.tokenizer.encode(&text.to_lowercase(), 64);
         let input = Tensor::i64(vec![1, 64], ids);
 
         #[cfg(feature = "gpu")]

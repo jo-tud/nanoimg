@@ -10,20 +10,28 @@ use std::sync::Arc;
 
 use crate::shape::*;
 
-// ── BLAS FFI ─────────────────────────────────────────────────────────────────
+// ── GEMM ─────────────────────────────────────────────────────────────────────
 
-const ROW_MAJOR: i32 = 101;
-const NO_TRANS: i32 = 111;
-const TRANS: i32 = 112;
-
-extern "C" {
-    fn cblas_sgemm(
-        order: i32, transa: i32, transb: i32,
-        m: i32, n: i32, k: i32,
-        alpha: f32, a: *const f32, lda: i32,
-        b: *const f32, ldb: i32,
-        beta: f32, c: *mut f32, ldc: i32,
-    );
+/// Row-major SGEMM: C = alpha·op(A)·op(B) + beta·C, where op(A) is m×k and op(B) is k×n.
+/// `lda`/`ldb`/`ldc` are the row strides of the matrices as stored (before transposition).
+fn sgemm(
+    trans_a: bool, trans_b: bool,
+    m: usize, n: usize, k: usize,
+    alpha: f32, a: &[f32], lda: usize,
+    b: &[f32], ldb: usize,
+    beta: f32, c: &mut [f32], ldc: usize,
+) {
+    let (rsa, csa) = if trans_a { (1, lda) } else { (lda, 1) };
+    let (rsb, csb) = if trans_b { (1, ldb) } else { (ldb, 1) };
+    assert!(c.len() >= (m - 1) * ldc + n, "sgemm: output too small");
+    unsafe {
+        matrixmultiply::sgemm(
+            m, k, n,
+            alpha, a.as_ptr(), rsa as isize, csa as isize,
+            b.as_ptr(), rsb as isize, csb as isize,
+            beta, c.as_mut_ptr(), ldc as isize, 1,
+        );
+    }
 }
 
 // ── Tensor ───────────────────────────────────────────────────────────────────
@@ -442,15 +450,10 @@ fn op_matmul(a: &Tensor, b: &Tensor) -> Tensor {
         let ai = broadcast_batch_idx(bi, &out_batch, a_batch) * a_mat;
         let bj = broadcast_batch_idx(bi, &out_batch, b_batch) * b_mat;
         let ci = bi * c_mat;
-        unsafe {
-            cblas_sgemm(
-                ROW_MAJOR, NO_TRANS, NO_TRANS,
-                m as i32, n as i32, k as i32,
-                1.0, ad[ai..].as_ptr(), k as i32,
-                bd[bj..].as_ptr(), n as i32,
-                0.0, out[ci..].as_mut_ptr(), n as i32,
-            );
-        }
+        sgemm(false, false, m, n, k,
+              1.0, &ad[ai..ai + a_mat], k,
+              &bd[bj..bj + b_mat], n,
+              0.0, &mut out[ci..ci + c_mat], n);
     }
 
     let mut shape = out_batch;
@@ -505,15 +508,10 @@ fn op_conv(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>, node: &Node) 
 
     // weight [c_out, patch] × col^T [patch, n_patches] → [c_out, n_patches] directly
     let mut out = vec![0f32; c_out * n_patches];
-    unsafe {
-        cblas_sgemm(
-            ROW_MAJOR, NO_TRANS, TRANS,
-            c_out as i32, n_patches as i32, patch as i32,
-            1.0, w_data.as_ptr(), patch as i32,
-            col.as_ptr(), patch as i32,
-            0.0, out.as_mut_ptr(), n_patches as i32,
-        );
-    }
+    sgemm(false, true, c_out, n_patches, patch,
+          1.0, w_data, patch,
+          &col, patch,
+          0.0, &mut out, n_patches);
 
     // Add bias ([c_out, n_patches] layout)
     if let Some(bias) = bias {
@@ -1004,17 +1002,10 @@ pub fn cpu_gemm(a: &Tensor, b: &Tensor, c: Option<&Tensor>,
     }
     let lda = if trans_a { m } else { k_a };
     let ldb = if trans_b { k_b } else { n };
-    unsafe {
-        cblas_sgemm(
-            ROW_MAJOR,
-            if trans_a { TRANS } else { NO_TRANS },
-            if trans_b { TRANS } else { NO_TRANS },
-            m as i32, n as i32, k_a as i32,
-            alpha, ad.as_ptr(), lda as i32,
-            bd.as_ptr(), ldb as i32,
-            beta, out.as_mut_ptr(), n as i32,
-        );
-    }
+    sgemm(trans_a, trans_b, m, n, k_a,
+          alpha, ad, lda,
+          bd, ldb,
+          beta, &mut out, n);
     Tensor::f32(vec![m, n], out)
 }
 
