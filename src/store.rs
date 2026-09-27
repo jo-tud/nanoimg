@@ -65,8 +65,8 @@ impl VectorStore {
         let mut buf = vec![0u8; self.dims * 4];
         self.f32_file.read_exact_at(&mut buf, byte_offset)
             .context("pread vectors_f32.bin")?;
-        let v: Vec<f32> = buf.chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        let v: Vec<f32> = buf.as_chunks::<4>().0.iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         Ok(v)
     }

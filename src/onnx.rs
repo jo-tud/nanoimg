@@ -66,8 +66,8 @@ impl F16Data {
     /// Widen elements `start..start + out.len()` into `out`.
     pub fn widen_range(&self, start: usize, out: &mut [f32]) {
         let bytes = &self.map[self.off + start * 2..self.off + (start + out.len()) * 2];
-        for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-            *o = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        for (o, b) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *o = f16_to_f32(u16::from_le_bytes(*b));
         }
     }
 
@@ -254,8 +254,8 @@ fn parse_tensor(data: &[u8], base_offset: usize) -> RawTensor {
             (2, 0) => t.data_type = r.read_varint() as i32,
             (4, 2) => {
                 let b = r.read_len_bytes();
-                for c in b.chunks_exact(4) {
-                    t.float_data.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                for c in b.as_chunks::<4>().0 {
+                    t.float_data.push(f32::from_le_bytes(*c));
                 }
             }
             (4, 5) => t.float_data.push(f32::from_bits(r.read_fixed32())),
@@ -404,8 +404,8 @@ impl OnnxModel {
                         data: TData::F32Mapped(mmap.clone(), raw.raw_data_offset, raw.raw_data_len / 4),
                     },
                     1 => {
-                        let data: Vec<f32> = bytes.chunks_exact(4)
-                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        let data: Vec<f32> = bytes.as_chunks::<4>().0.iter()
+                            .map(|b| f32::from_le_bytes(*b))
                             .collect();
                         Tensor::f32(raw.dims, data)
                     }
@@ -419,8 +419,8 @@ impl OnnxModel {
                         })),
                     },
                     7 => {
-                        let data: Vec<i64> = bytes.chunks_exact(8)
-                            .map(|b| i64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]))
+                        let data: Vec<i64> = bytes.as_chunks::<8>().0.iter()
+                            .map(|b| i64::from_le_bytes(*b))
                             .collect();
                         Tensor::i64(raw.dims, data)
                     }
