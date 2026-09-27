@@ -11,6 +11,10 @@ pub struct BpeTokenizer {
     merge_rank: HashMap<(u32, u32), u32>,
     pad_id: u32,
     unk_id: u32,
+    eos_id: Option<u32>,
+    /// Byte-fallback tokens `<0x00>`..`<0xFF>` for characters missing from the vocab
+    /// (a byte without its own token maps to `<unk>`). Empty if the vocab has none.
+    byte_ids: Vec<u32>,
 }
 
 impl BpeTokenizer {
@@ -36,22 +40,40 @@ impl BpeTokenizer {
             }
         }
 
-        let pad_id = vocab.get(&b"<pad>"[..].to_vec()).copied().unwrap_or(0);
-        let unk_id = vocab.get(&b"<unk>"[..].to_vec()).copied().unwrap_or(3);
+        let pad_id = vocab.get(b"<pad>".as_slice()).copied().unwrap_or(0);
+        let unk_id = vocab.get(b"<unk>".as_slice()).copied().unwrap_or(3);
+        let eos_id = vocab.get(b"<eos>".as_slice()).copied();
+        let byte_ids: Vec<Option<u32>> = (0..256)
+            .map(|b| vocab.get(format!("<0x{b:02X}>").as_bytes()).copied())
+            .collect();
+        let byte_ids = if byte_ids.iter().any(Option::is_some) {
+            byte_ids.into_iter().map(|id| id.unwrap_or(unk_id)).collect()
+        } else {
+            Vec::new()
+        };
 
-        Ok(Self { vocab, id_to_bytes, merge_rank, pad_id, unk_id })
+        Ok(Self { vocab, id_to_bytes, merge_rank, pad_id, unk_id, eos_id, byte_ids })
     }
 
+    /// Encode `text` like the reference `tokenizers` pipeline for SigLIP2:
+    /// BPE with byte fallback, then `<eos>`, then padding/truncation to `max_len`.
     pub fn encode(&self, text: &str, max_len: usize) -> Vec<i64> {
         // Normalize: replace space with ▁ (U+2581)
         let normalized = text.replace(' ', "\u{2581}");
 
-        // Split into individual characters, map to vocab IDs
-        let mut ids: Vec<u32> = normalized.chars().map(|c| {
+        // Split into individual characters, map to vocab IDs.
+        // Unknown characters fall back to their UTF-8 bytes (<0xNN> tokens).
+        let mut ids: Vec<u32> = Vec::with_capacity(normalized.len());
+        for c in normalized.chars() {
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
-            self.vocab.get(s.as_bytes()).copied().unwrap_or(self.unk_id)
-        }).collect();
+            match self.vocab.get(s.as_bytes()) {
+                Some(&id) => ids.push(id),
+                None if !self.byte_ids.is_empty() =>
+                    ids.extend(s.bytes().map(|b| self.byte_ids[b as usize])),
+                None => ids.push(self.unk_id),
+            }
+        }
 
         // Iterative BPE merging
         loop {
@@ -59,11 +81,11 @@ impl BpeTokenizer {
             let mut best_rank = u32::MAX;
             let mut best_pos = 0;
             for i in 0..ids.len() - 1 {
-                if let Some(&rank) = self.merge_rank.get(&(ids[i], ids[i + 1])) {
-                    if rank < best_rank {
-                        best_rank = rank;
-                        best_pos = i;
-                    }
+                if let Some(&rank) = self.merge_rank.get(&(ids[i], ids[i + 1]))
+                    && rank < best_rank
+                {
+                    best_rank = rank;
+                    best_pos = i;
                 }
             }
             if best_rank == u32::MAX { break; }
@@ -77,8 +99,12 @@ impl BpeTokenizer {
             ids.remove(best_pos + 1);
         }
 
-        // Convert to i64, pad/truncate
+        // Truncate leaving room for <eos> (post-processor template: "$A <eos>"), then pad
         let mut result: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
+        if let Some(eos) = self.eos_id {
+            result.truncate(max_len.saturating_sub(1));
+            result.push(eos as i64);
+        }
         result.truncate(max_len);
         result.resize(max_len, self.pad_id as i64);
         result
@@ -207,7 +233,10 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-fn parse_tokenizer_json(data: &[u8]) -> Result<(Vec<(Vec<u8>, u32)>, Vec<(Vec<u8>, Vec<u8>)>)> {
+/// (token bytes, id) pairs and (left, right) merge pairs in rank order.
+type VocabAndMerges = (Vec<(Vec<u8>, u32)>, Vec<(Vec<u8>, Vec<u8>)>);
+
+fn parse_tokenizer_json(data: &[u8]) -> Result<VocabAndMerges> {
     let mut p = JsonParser { data, pos: 0 };
     let mut vocab = Vec::new();
     let mut merges = Vec::new();
@@ -302,4 +331,39 @@ fn parse_tokenizer_json(data: &[u8]) -> Result<(Vec<(Vec<u8>, u32)>, Vec<(Vec<u8
         bail!("no vocab found in tokenizer.json");
     }
     Ok((vocab, merges))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Expected IDs come from the reference HF `tokenizers` library
+    /// (`Tokenizer.from_file(...)` with truncation to 64) on the same tokenizer.json.
+    #[test]
+    #[ignore] // needs ~/.nanoimg/models/tokenizer.json
+    fn matches_reference_tokenizer() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let tok = BpeTokenizer::load(&Path::new(&home).join(".nanoimg/models/tokenizer.json"))
+            .expect("load tokenizer");
+        let cases: &[(&str, &[i64])] = &[
+            ("a photo of a cat", &[235250, 2686, 576, 476, 4401, 1]),
+            ("zwei kinder spielen am strand", &[131201, 42900, 63859, 1144, 40672, 1]),
+            ("🐶 dog", &[241878, 5929, 1]),
+            // 𓀀 is not in the vocab → UTF-8 byte fallback
+            ("𓀀 hieroglyph", &[457, 364, 345, 345, 186636, 836, 1]),
+            ("  double  space ", &[139, 4576, 139, 11035, 235248, 1]),
+        ];
+        for (text, want) in cases {
+            let got = tok.encode(text, 64);
+            assert_eq!(got.len(), 64);
+            assert_eq!(&got[..want.len()], *want, "text: {text:?}");
+            assert!(got[want.len()..].iter().all(|&id| id == 0), "padding: {text:?}");
+        }
+
+        // Overlong input: truncated to 63 tokens, <eos> last
+        let long = tok.encode(&["word"; 70].join(" "), 64);
+        assert_eq!(long.len(), 64);
+        assert_eq!(&long[..2], &[1928, 2204]);
+        assert_eq!(&long[62..], &[2204, 1]);
+    }
 }

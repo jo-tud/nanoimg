@@ -1,8 +1,9 @@
 [package]
 name        = "nanoimg"
-version     = "0.3.0"
-edition     = "2021"
-description = "Semantic image search in ~2400 lines of from-scratch Rust"
+version     = "0.4.0"
+edition     = "2024"
+rust-version = "1.90"
+description = "Semantic image search in ~2750 lines of from-scratch Rust"
 license     = "MIT"
 readme      = "README.md"
 keywords    = ["image", "search", "semantic", "siglip", "onnx"]
@@ -12,20 +13,27 @@ categories  = ["multimedia::images", "command-line-utilities"]
 name = "nanoimg"
 path = "src/main.rs"
 
+[lints.clippy]
+# Numeric kernels index several arrays in lockstep; iterators would obscure them
+needless_range_loop = "allow"
+# Hot-path helpers take plain dimensions/buffers rather than ad-hoc structs
+too_many_arguments = "allow"
+
 [features]
 default = ["gpu"]
 gpu = ["dep:wgpu", "dep:pollster"]
 
 [dependencies]
-wgpu     = { version = "28", optional = true }
-pollster = { version = "0.4", optional = true }
-clap        = { version = "4", features = ["derive"] }
+wgpu     = { version = "30", optional = true }
+pollster = { version = "1", optional = true }
+clap        = { version = "4", features = ["derive", "env"] }
 usearch     = "2"
 image       = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp", "avif"] }
 rayon       = "1"
 memmap2     = "0.9"
 anyhow      = "1"
-ureq        = { version = "2", features = ["tls"] }
-sha2        = "0.10"
+ureq        = { version = "3", default-features = false, features = ["rustls"] }
+sha2        = "0.11"
 libc        = "0.2"
 minifb      = "0.28"
+matrixmultiply = { version = "0.3", features = ["threading"] }

@@ -1,29 +1,38 @@
 //! Minimal ONNX runtime tailored to SigLIP2 models.
-//! Supports the 21 operators used by the image and text encoders.
-//! Weight data is loaded from protobuf into owned tensors at model load time.
+//! Supports the 22 operators used by the SigLIP2 image and text encoders.
+//! Weights stay in the memory-mapped model file where alignment allows (zero-copy,
+//! pages load on first touch); misaligned or non-raw weights are copied out.
 
 use anyhow::{bail, Context, Result};
-use memmap2::MmapOptions;
+use memmap2::{Mmap, MmapOptions};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::shape::*;
 
-// ── BLAS FFI ─────────────────────────────────────────────────────────────────
+// ── GEMM ─────────────────────────────────────────────────────────────────────
 
-const ROW_MAJOR: i32 = 101;
-const NO_TRANS: i32 = 111;
-const TRANS: i32 = 112;
-
-extern "C" {
-    fn cblas_sgemm(
-        order: i32, transa: i32, transb: i32,
-        m: i32, n: i32, k: i32,
-        alpha: f32, a: *const f32, lda: i32,
-        b: *const f32, ldb: i32,
-        beta: f32, c: *mut f32, ldc: i32,
-    );
+/// Row-major SGEMM: C = alpha·op(A)·op(B) + beta·C, where op(A) is m×k and op(B) is k×n.
+/// `lda`/`ldb`/`ldc` are the row strides of the matrices as stored (before transposition).
+fn sgemm(
+    trans_a: bool, trans_b: bool,
+    m: usize, n: usize, k: usize,
+    alpha: f32, a: &[f32], lda: usize,
+    b: &[f32], ldb: usize,
+    beta: f32, c: &mut [f32], ldc: usize,
+) {
+    let (rsa, csa) = if trans_a { (1, lda) } else { (lda, 1) };
+    let (rsb, csb) = if trans_b { (1, ldb) } else { (ldb, 1) };
+    assert!(c.len() >= (m - 1) * ldc + n, "sgemm: output too small");
+    unsafe {
+        matrixmultiply::sgemm(
+            m, k, n,
+            alpha, a.as_ptr(), rsa as isize, csa as isize,
+            b.as_ptr(), rsb as isize, csb as isize,
+            beta, c.as_mut_ptr(), ldc as isize, 1,
+        );
+    }
 }
 
 // ── Tensor ───────────────────────────────────────────────────────────────────
@@ -38,6 +47,51 @@ pub struct Tensor {
 pub enum TData {
     F32(Arc<Vec<f32>>),
     I64(Arc<Vec<i64>>),
+    /// f32 weights borrowed from the mapped model file: (map, byte offset, element count).
+    /// The offset is 4-byte aligned (checked at load).
+    F32Mapped(Arc<Mmap>, usize, usize),
+    /// fp16 weights left in the mapped file, widened to f32 on first full use.
+    /// Gather reads single rows without converting the rest (token embedding tables).
+    F16Mapped(Arc<F16Data>),
+}
+
+pub struct F16Data {
+    map: Arc<Mmap>,
+    off: usize,
+    len: usize,
+    widened: OnceLock<Vec<f32>>,
+}
+
+impl F16Data {
+    /// Widen elements `start..start + out.len()` into `out`.
+    pub fn widen_range(&self, start: usize, out: &mut [f32]) {
+        let bytes = &self.map[self.off + start * 2..self.off + (start + out.len()) * 2];
+        for (o, b) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *o = f16_to_f32(u16::from_le_bytes(*b));
+        }
+    }
+
+    fn widen_all(&self) -> Vec<f32> {
+        let mut v = vec![0f32; self.len];
+        self.widen_range(0, &mut v);
+        v
+    }
+}
+
+/// IEEE 754 half → single precision.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x3ff) as u32;
+    match exp {
+        0 => {
+            // zero / subnormal: mant · 2⁻²⁴
+            let v = mant as f32 * (1.0 / 16_777_216.0);
+            if sign != 0 { -v } else { v }
+        }
+        31 => f32::from_bits(sign | 0x7f80_0000 | (mant << 13)), // inf / NaN
+        _ => f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13)),
+    }
 }
 
 impl Tensor {
@@ -48,16 +102,31 @@ impl Tensor {
         Self { shape, data: TData::I64(Arc::new(data)) }
     }
     pub fn as_f32(&self) -> &[f32] {
-        match &self.data { TData::F32(v) => v, _ => panic!("expected f32") }
+        match &self.data {
+            TData::F32(v) => v,
+            // SAFETY: offset is 4-aligned (mmap base is page-aligned) and in bounds,
+            // checked when the tensor was created; the map is read-only and kept alive by the Arc.
+            TData::F32Mapped(map, off, len) => unsafe {
+                std::slice::from_raw_parts(map.as_ptr().add(*off) as *const f32, *len)
+            },
+            TData::F16Mapped(d) => d.widened.get_or_init(|| d.widen_all()),
+            TData::I64(_) => panic!("expected f32"),
+        }
+    }
+    /// f32 view without caching a widened copy of fp16 data (for one-off uploads).
+    #[cfg(feature = "gpu")]
+    pub fn f32_data(&self) -> std::borrow::Cow<'_, [f32]> {
+        use std::borrow::Cow;
+        match &self.data {
+            TData::F16Mapped(d) if d.widened.get().is_none() => Cow::Owned(d.widen_all()),
+            _ => Cow::Borrowed(self.as_f32()),
+        }
     }
     pub fn as_i64(&self) -> &[i64] {
         match &self.data { TData::I64(v) => v, _ => panic!("expected i64") }
     }
-    pub fn numel(&self) -> usize {
-        self.shape.iter().product::<usize>().max(1)
-    }
     pub fn is_f32(&self) -> bool {
-        matches!(&self.data, TData::F32(_))
+        !matches!(&self.data, TData::I64(_))
     }
 }
 
@@ -185,8 +254,8 @@ fn parse_tensor(data: &[u8], base_offset: usize) -> RawTensor {
             (2, 0) => t.data_type = r.read_varint() as i32,
             (4, 2) => {
                 let b = r.read_len_bytes();
-                for c in b.chunks_exact(4) {
-                    t.float_data.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                for c in b.as_chunks::<4>().0 {
+                    t.float_data.push(f32::from_le_bytes(*c));
                 }
             }
             (4, 5) => t.float_data.push(f32::from_bits(r.read_fixed32())),
@@ -278,7 +347,7 @@ impl OnnxModel {
     pub fn load(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)
             .with_context(|| format!("open {}", path.display()))?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let mmap = Arc::new(unsafe { MmapOptions::new().map(&file)? });
         let mmap_data = &mmap[..];
 
         // Parse ModelProto → find GraphProto (field 7)
@@ -330,20 +399,35 @@ impl OnnxModel {
             let tensor = if raw.raw_data_len > 0 {
                 let bytes = &mmap_data[raw.raw_data_offset..raw.raw_data_offset + raw.raw_data_len];
                 match raw.data_type {
+                    1 if cfg!(target_endian = "little") && raw.raw_data_offset % 4 == 0 => Tensor {
+                        shape: raw.dims,
+                        data: TData::F32Mapped(mmap.clone(), raw.raw_data_offset, raw.raw_data_len / 4),
+                    },
                     1 => {
-                        let data: Vec<f32> = bytes.chunks_exact(4)
-                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        let data: Vec<f32> = bytes.as_chunks::<4>().0.iter()
+                            .map(|b| f32::from_le_bytes(*b))
                             .collect();
                         Tensor::f32(raw.dims, data)
                     }
+                    10 => Tensor {
+                        shape: raw.dims,
+                        data: TData::F16Mapped(Arc::new(F16Data {
+                            map: mmap.clone(),
+                            off: raw.raw_data_offset,
+                            len: raw.raw_data_len / 2,
+                            widened: OnceLock::new(),
+                        })),
+                    },
                     7 => {
-                        let data: Vec<i64> = bytes.chunks_exact(8)
-                            .map(|b| i64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]))
+                        let data: Vec<i64> = bytes.as_chunks::<8>().0.iter()
+                            .map(|b| i64::from_le_bytes(*b))
                             .collect();
                         Tensor::i64(raw.dims, data)
                     }
                     dt => bail!("unsupported data type {} in initializer {}", dt, raw.name),
                 }
+            } else if raw.data_type == 10 {
+                bail!("fp16 initializer {} without raw_data is not supported", raw.name);
             } else if !raw.float_data.is_empty() {
                 Tensor::f32(raw.dims, raw.float_data)
             } else if !raw.int64_data.is_empty() {
@@ -354,7 +438,6 @@ impl OnnxModel {
             weights.insert(raw.name, tensor);
         }
 
-        // mmap is dropped here — all weight data is in owned Vecs
         Ok(OnnxModel { nodes, weights, graph_outputs })
     }
 }
@@ -382,7 +465,7 @@ fn binary_op(a: &Tensor, b: &Tensor, f: fn(f32, f32) -> f32) -> Tensor {
     }
     // Fast path: inner broadcast (LayerNorm γ/β, e.g. [1,197,768] op [768])
     let inner = *a.shape.last().unwrap_or(&0);
-    if bd.len() == inner && inner > 0 && ad.len() % inner == 0 {
+    if bd.len() == inner && inner > 0 && ad.len().is_multiple_of(inner) {
         let out_shape = broadcast_shape(&a.shape, &b.shape);
         return Tensor::f32(out_shape,
             ad.chunks_exact(inner)
@@ -442,15 +525,10 @@ fn op_matmul(a: &Tensor, b: &Tensor) -> Tensor {
         let ai = broadcast_batch_idx(bi, &out_batch, a_batch) * a_mat;
         let bj = broadcast_batch_idx(bi, &out_batch, b_batch) * b_mat;
         let ci = bi * c_mat;
-        unsafe {
-            cblas_sgemm(
-                ROW_MAJOR, NO_TRANS, NO_TRANS,
-                m as i32, n as i32, k as i32,
-                1.0, ad[ai..].as_ptr(), k as i32,
-                bd[bj..].as_ptr(), n as i32,
-                0.0, out[ci..].as_mut_ptr(), n as i32,
-            );
-        }
+        sgemm(false, false, m, n, k,
+              1.0, &ad[ai..ai + a_mat], k,
+              &bd[bj..bj + b_mat], n,
+              0.0, &mut out[ci..ci + c_mat], n);
     }
 
     let mut shape = out_batch;
@@ -485,43 +563,39 @@ fn op_conv(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>, node: &Node) 
 
     let in_data = input.as_f32();
     let w_data = weight.as_f32();
-
-    // im2col
+    let mut out = vec![0f32; n_batch * c_out * n_patches];
     let mut col = vec![0f32; n_patches * patch];
-    for py in 0..h_out {
-        for px in 0..w_out {
-            let (ys, xs) = (py * sh, px * sw);
-            let pi = py * w_out + px;
-            for c in 0..c_in {
-                for ky in 0..kh {
-                    for kx in 0..kw {
-                        col[pi * patch + c * kh * kw + ky * kw + kx] =
-                            in_data[c * h * w + (ys + ky) * w + (xs + kx)];
+
+    for (img, out) in in_data.chunks_exact(c_in * h * w).zip(out.chunks_exact_mut(c_out * n_patches)) {
+        // im2col
+        for py in 0..h_out {
+            for px in 0..w_out {
+                let (ys, xs) = (py * sh, px * sw);
+                let pi = py * w_out + px;
+                for c in 0..c_in {
+                    for ky in 0..kh {
+                        for kx in 0..kw {
+                            col[pi * patch + c * kh * kw + ky * kw + kx] =
+                                img[c * h * w + (ys + ky) * w + (xs + kx)];
+                        }
                     }
                 }
             }
         }
-    }
 
-    // weight [c_out, patch] × col^T [patch, n_patches] → [c_out, n_patches] directly
-    let mut out = vec![0f32; c_out * n_patches];
-    unsafe {
-        cblas_sgemm(
-            ROW_MAJOR, NO_TRANS, TRANS,
-            c_out as i32, n_patches as i32, patch as i32,
-            1.0, w_data.as_ptr(), patch as i32,
-            col.as_ptr(), patch as i32,
-            0.0, out.as_mut_ptr(), n_patches as i32,
-        );
-    }
+        // weight [c_out, patch] × col^T [patch, n_patches] → [c_out, n_patches] directly
+        sgemm(false, true, c_out, n_patches, patch,
+              1.0, w_data, patch,
+              &col, patch,
+              0.0, out, n_patches);
 
-    // Add bias ([c_out, n_patches] layout)
-    if let Some(bias) = bias {
-        let b = bias.as_f32();
-        for j in 0..c_out {
-            let row = &mut out[j * n_patches..(j + 1) * n_patches];
-            let bj = b[j];
-            for v in row { *v += bj; }
+        // Add bias ([c_out, n_patches] layout)
+        if let Some(bias) = bias {
+            let b = bias.as_f32();
+            for j in 0..c_out {
+                let bj = b[j];
+                for v in &mut out[j * n_patches..(j + 1) * n_patches] { *v += bj; }
+            }
         }
     }
 
@@ -622,19 +696,22 @@ fn op_reduce_mean(data: &Tensor, axes: &[i64], keepdims: bool) -> Tensor {
 }
 
 fn op_reshape(data: &Tensor, shape: &Tensor) -> Tensor {
-    let shape_vals = shape.as_i64();
-    let total: usize = data.numel();
-    let mut new_shape: Vec<usize> = shape_vals.iter().map(|&v| {
-        if v == 0 { 1 } else if v == -1 { 0 } else { v as usize }
-    }).collect();
+    Tensor { shape: reshape_dims(&data.shape, shape.as_i64()), data: data.data.clone() }
+}
 
-    // Resolve -1
-    let known: usize = new_shape.iter().filter(|&&v| v != 0).product::<usize>().max(1);
-    for v in &mut new_shape {
+/// Resolve an ONNX Reshape target (allowzero=0): 0 copies the input dim, -1 is inferred.
+pub fn reshape_dims(in_shape: &[usize], target: &[i64]) -> Vec<usize> {
+    let total: usize = in_shape.iter().product::<usize>().max(1);
+    let mut out: Vec<usize> = target.iter().enumerate().map(|(i, &v)| match v {
+        0 => in_shape.get(i).copied().unwrap_or(1),
+        -1 => 0,
+        v => v as usize,
+    }).collect();
+    let known: usize = out.iter().filter(|&&v| v != 0).product::<usize>().max(1);
+    for v in &mut out {
         if *v == 0 { *v = total / known; }
     }
-
-    Tensor { shape: new_shape, data: data.data.clone() }
+    out
 }
 
 fn op_transpose(data: &Tensor, perm: Option<&[i64]>) -> Tensor {
@@ -775,7 +852,7 @@ fn op_slice(data: &Tensor, starts: &Tensor, ends: &Tensor,
         s = s.clamp(0, dim);
         e = e.clamp(0, dim);
         if e > dim { e = dim; }
-        let len = if e > s { ((e - s) as usize + step - 1) / step } else { 0 };
+        let len = if e > s { ((e - s) as usize).div_ceil(step) } else { 0 };
         slice_start[axis] = s as usize;
         slice_step[axis] = step;
         out_shape[axis] = len;
@@ -823,7 +900,20 @@ fn op_gather(data: &Tensor, indices: &Tensor, axis: i64) -> Tensor {
     let idx_count: usize = indices.shape.iter().product::<usize>().max(1);
 
     match &data.data {
-        TData::F32(dv) => {
+        TData::F16Mapped(d) if d.widened.get().is_none() => {
+            // Widen only the gathered rows (a query needs 64 rows of a 256k-row table)
+            let mut out = vec![0f32; out_shape.iter().product::<usize>().max(1)];
+            for o in 0..outer {
+                for (ip, &iv) in idx.iter().enumerate() {
+                    let i = if iv < 0 { axis_size as i64 + iv } else { iv } as usize;
+                    let dst = (o * idx_count + ip) * inner;
+                    d.widen_range((o * axis_size + i) * inner, &mut out[dst..dst + inner]);
+                }
+            }
+            Tensor::f32(out_shape, out)
+        }
+        TData::F32(_) | TData::F32Mapped(..) | TData::F16Mapped(_) => {
+            let dv = data.as_f32();
             let mut out = vec![0f32; out_shape.iter().product::<usize>().max(1)];
             for o in 0..outer {
                 for (ip, &iv) in idx.iter().enumerate() {
@@ -876,6 +966,24 @@ fn op_tile(data: &Tensor, repeats: &Tensor) -> Tensor {
         out[i] = in_data[in_idx];
     }
     Tensor::f32(out_shape, out)
+}
+
+/// Cast between the types this runtime keeps. All float math runs in f32, so the
+/// FLOAT16 casts at the edges of fp16 graphs are identities.
+pub fn op_cast(data: &Tensor, node: &Node) -> Result<Tensor> {
+    check_cast(node, data.is_f32())?;
+    Ok(data.clone())
+}
+
+/// Ok if casting a float (or int64) tensor per `node` is an identity here.
+pub fn check_cast(node: &Node, is_float: bool) -> Result<()> {
+    const FLOAT: i64 = 1;
+    const INT64: i64 = 7;
+    const FLOAT16: i64 = 10;
+    match (node.attr_i("to"), is_float) {
+        (Some(FLOAT | FLOAT16), true) | (Some(INT64), false) => Ok(()),
+        (to, _) => bail!("unsupported Cast to {:?}", to),
+    }
 }
 
 // ── Graph executor ───────────────────────────────────────────────────────────
@@ -969,13 +1077,14 @@ fn exec_node(
         "Unsqueeze" => op_unsqueeze(inp(0), inp(1)),
         "Squeeze" => op_squeeze(inp(0), get(1)),
         "Concat" => {
-            let ts: Vec<&Tensor> = (0..node.inputs.len()).filter_map(|i| get(i)).collect();
+            let ts: Vec<&Tensor> = (0..node.inputs.len()).filter_map(&get).collect();
             op_concat(&ts, node.attr_i("axis").unwrap_or(0))
         }
         "Slice" => op_slice(inp(0), inp(1), inp(2), get(3), get(4)),
         "Gather" => op_gather(inp(0), inp(1), node.attr_i("axis").unwrap_or(0)),
         "Shape" => op_shape(inp(0)),
         "Tile" => op_tile(inp(0), inp(1)),
+        "Cast" => op_cast(inp(0), node)?,
         _ => bail!("unsupported op: {}", node.op_type),
     };
 
@@ -1004,17 +1113,10 @@ pub fn cpu_gemm(a: &Tensor, b: &Tensor, c: Option<&Tensor>,
     }
     let lda = if trans_a { m } else { k_a };
     let ldb = if trans_b { k_b } else { n };
-    unsafe {
-        cblas_sgemm(
-            ROW_MAJOR,
-            if trans_a { TRANS } else { NO_TRANS },
-            if trans_b { TRANS } else { NO_TRANS },
-            m as i32, n as i32, k_a as i32,
-            alpha, ad.as_ptr(), lda as i32,
-            bd.as_ptr(), ldb as i32,
-            beta, out.as_mut_ptr(), n as i32,
-        );
-    }
+    sgemm(trans_a, trans_b, m, n, k_a,
+          alpha, ad, lda,
+          bd, ldb,
+          beta, &mut out, n);
     Tensor::f32(vec![m, n], out)
 }
 
@@ -1052,4 +1154,51 @@ pub fn cpu_squeeze(data: &Tensor, axes: Option<&Tensor>) -> Tensor {
 #[cfg(feature = "gpu")]
 pub fn cpu_reshape(data: &Tensor, shape: &Tensor) -> Tensor {
     op_reshape(data, shape)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_conversion() {
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0xc000), -2.0);
+        assert_eq!(f16_to_f32(0x3555), 0.333_251_95); // nearest half to 1/3
+        assert_eq!(f16_to_f32(0x7bff), 65504.0); // max normal
+        assert_eq!(f16_to_f32(0x0001), 5.960_464_5e-8); // min subnormal
+        assert_eq!(f16_to_f32(0x8001), -5.960_464_5e-8);
+        assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);
+        assert!(f16_to_f32(0x7e00).is_nan());
+    }
+
+    /// Row-wise fp16 Gather (used for token embeddings) must match full widening.
+    #[test]
+    fn f16_gather_matches_widened() {
+        let path = std::env::temp_dir().join(format!("nanoimg_f16_{}", std::process::id()));
+        // 1 pad byte so the table starts unaligned, like real fp16 initializers can
+        let halves: Vec<u16> = (0..12u16).map(|i| 0x3c00 + i * 0x80).collect(); // 1.0, 1.125, ...
+        let mut bytes = vec![0u8];
+        bytes.extend(halves.iter().flat_map(|h| h.to_le_bytes()));
+        std::fs::write(&path, &bytes).unwrap();
+        let map = Arc::new(unsafe { MmapOptions::new().map(&std::fs::File::open(&path).unwrap()).unwrap() });
+        let table = || Tensor {
+            shape: vec![4, 3],
+            data: TData::F16Mapped(Arc::new(F16Data { map: map.clone(), off: 1, len: 12, widened: OnceLock::new() })),
+        };
+        let idx = Tensor::i64(vec![2], vec![2, -4]); // row 2 and row 0 (negative index)
+
+        let lazy = table();
+        let rows = op_gather(&lazy, &idx, 0);
+        assert!(matches!(&lazy.data, TData::F16Mapped(d) if d.widened.get().is_none()), "gather widened whole table");
+
+        let full = table();
+        full.as_f32(); // force widening → generic path
+        let expect = op_gather(&full, &idx, 0);
+        assert_eq!(rows.shape, vec![2, 3]);
+        assert_eq!(rows.as_f32(), expect.as_f32());
+        assert_eq!(rows.as_f32(), &[1.75, 1.875, 2.0, 1.0, 1.125, 1.25]);
+        std::fs::remove_file(&path).ok();
+    }
 }

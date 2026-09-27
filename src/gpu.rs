@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
-use wgpu::util::DeviceExt;
+use std::sync::{Arc, Mutex};
 
 use crate::onnx::{Node, OnnxModel, Tensor};
 use crate::shape::*;
@@ -18,9 +18,14 @@ pub struct GpuContext {
 
 impl GpuContext {
     pub fn try_new() -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        Self::with_buffer_limit(None)
+    }
+
+    /// `max_buffer`: cap on buffer size below the adapter's (tests force failures with it).
+    fn with_buffer_limit(max_buffer: Option<u64>) -> Option<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -31,12 +36,15 @@ impl GpuContext {
         };
         let name = adapter.get_info().name.clone();
         let adapter_limits = adapter.limits();
+        let max_buffer = max_buffer.unwrap_or(adapter_limits.max_buffer_size)
+            .min(adapter_limits.max_buffer_size);
         let (device, queue) = match pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("nanoimg"),
                 required_limits: wgpu::Limits {
-                    max_buffer_size: adapter_limits.max_buffer_size,
-                    max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+                    max_buffer_size: max_buffer,
+                    max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size
+                        .min(max_buffer),
                     ..wgpu::Limits::downlevel_defaults()
                 },
                 ..Default::default()
@@ -79,52 +87,85 @@ struct MatMulParams {
 }
 @group(0) @binding(3) var<uniform> params: MatMulParams;
 
-const TILE: u32 = 16u;
-var<workgroup> tile_a: array<f32, 256>; // 16*16
-var<workgroup> tile_b: array<f32, 256>;
+// Register-blocked SGEMM: a 16x16 workgroup computes a 64x64 tile of C, each
+// thread a 4x4 block. Thread (tx, ty) owns rows ty + 16*i and cols tx + 16*j,
+// so shared-memory reads and global stores are contiguous across a warp.
+const BM: u32 = 64u;
+const BN: u32 = 64u;
+const BK: u32 = 16u;
+var<workgroup> tile_a: array<f32, 1024>; // [BK][BM], k-major
+var<workgroup> tile_b: array<f32, 1024>; // [BK][BN]
 
 @compute @workgroup_size(16, 16, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>,
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
-    let row = gid.y;
-    let col = gid.x;
-    let batch_idx = wid.z;
-    let a_off = batch_idx * params.a_batch_stride;
-    let b_off = batch_idx * params.b_batch_stride;
-    let c_off = batch_idx * params.c_batch_stride;
+    let tx = lid.x;
+    let ty = lid.y;
+    let tid = ty * 16u + tx;
+    let row0 = wid.y * BM;
+    let col0 = wid.x * BN;
+    let a_off = wid.z * params.a_batch_stride;
+    let b_off = wid.z * params.b_batch_stride;
+    let c_off = wid.z * params.c_batch_stride;
+    let M = params.M;
+    let N = params.N;
+    let K = params.K;
 
-    var acc: f32 = 0.0;
-    let num_tiles = (params.K + TILE - 1u) / TILE;
+    // Accumulators as named vec4s (row i, cols j): indexed arrays would spill
+    // out of registers since naga does not unroll the loops.
+    var acc0 = vec4<f32>(0.0);
+    var acc1 = vec4<f32>(0.0);
+    var acc2 = vec4<f32>(0.0);
+    var acc3 = vec4<f32>(0.0);
 
-    for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
-        let a_col = t * TILE + lid.x;
-        let b_row = t * TILE + lid.y;
-
-        if (row < params.M && a_col < params.K) {
-            tile_a[lid.y * TILE + lid.x] = a[a_off + row * params.K + a_col];
-        } else {
-            tile_a[lid.y * TILE + lid.x] = 0.0;
+    for (var k0 = 0u; k0 < K; k0 += BK) {
+        // Load A tile (BM x BK) and B tile (BK x BN): 4 elements per thread each
+        for (var l = 0u; l < 4u; l++) {
+            let e = tid + l * 256u;
+            // A: e -> (r = e / BK, kk = e % BK); consecutive threads walk k (contiguous in A)
+            let ar = e / BK;
+            let ak = e % BK;
+            let gr = row0 + ar;
+            let gk = k0 + ak;
+            var av = 0.0;
+            if (gr < M && gk < K) { av = a[a_off + gr * K + gk]; }
+            tile_a[ak * BM + ar] = av;
+            // B: e -> (kk = e / BN, cc = e % BN); consecutive threads walk n (contiguous in B)
+            let bk = e / BN;
+            let bc = e % BN;
+            let gk2 = k0 + bk;
+            let gc = col0 + bc;
+            var bv = 0.0;
+            if (gk2 < K && gc < N) { bv = b[b_off + gk2 * N + gc]; }
+            tile_b[bk * BN + bc] = bv;
         }
-
-        if (b_row < params.K && col < params.N) {
-            tile_b[lid.y * TILE + lid.x] = b[b_off + b_row * params.N + col];
-        } else {
-            tile_b[lid.y * TILE + lid.x] = 0.0;
-        }
-
         workgroupBarrier();
 
-        for (var k: u32 = 0u; k < TILE; k = k + 1u) {
-            acc += tile_a[lid.y * TILE + k] * tile_b[k * TILE + lid.x];
+        for (var kk = 0u; kk < BK; kk++) {
+            let ab = kk * BM + ty;
+            let bb = kk * BN + tx;
+            let rb = vec4<f32>(tile_b[bb], tile_b[bb + 16u], tile_b[bb + 32u], tile_b[bb + 48u]);
+            acc0 = fma(vec4<f32>(tile_a[ab]), rb, acc0);
+            acc1 = fma(vec4<f32>(tile_a[ab + 16u]), rb, acc1);
+            acc2 = fma(vec4<f32>(tile_a[ab + 32u]), rb, acc2);
+            acc3 = fma(vec4<f32>(tile_a[ab + 48u]), rb, acc3);
         }
-
         workgroupBarrier();
     }
 
-    if (row < params.M && col < params.N) {
-        c[c_off + row * params.N + col] = acc;
-    }
+    store_row(row0 + ty, col0 + tx, c_off, acc0);
+    store_row(row0 + ty + 16u, col0 + tx, c_off, acc1);
+    store_row(row0 + ty + 32u, col0 + tx, c_off, acc2);
+    store_row(row0 + ty + 48u, col0 + tx, c_off, acc3);
+}
+
+fn store_row(r: u32, c0: u32, c_off: u32, v: vec4<f32>) {
+    if (r >= params.M) { return; }
+    let base = c_off + r * params.N;
+    if (c0 < params.N) { c[base + c0] = v.x; }
+    if (c0 + 16u < params.N) { c[base + c0 + 16u] = v.y; }
+    if (c0 + 32u < params.N) { c[base + c0 + 32u] = v.z; }
+    if (c0 + 48u < params.N) { c[base + c0 + 48u] = v.w; }
 }
 ";
 
@@ -137,28 +178,44 @@ struct BinaryParams {
     total: u32,
     ndim: u32,
     opcode: u32, // 0=add 1=mul 2=sub 3=div 4=pow
+    // Per-operand index mode: 0 = same layout as out, 1 = scalar,
+    // 2 = trailing broadcast (index % len), 3 = general strided
+    a_mode: u32,
+    b_mode: u32,
+    a_len: u32,
+    b_len: u32,
     _pad: u32,
-    // packed: out_shape[8], a_strides[8], b_strides[8], out_strides[8]
 }
 @group(0) @binding(3) var<uniform> params: BinaryParams;
 @group(0) @binding(4) var<storage, read> shape_data: array<u32>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid2: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    // Large dispatches span a 2D grid of 256-wide groups (see GpuExecutor::grid)
+    let gid = vec3<u32>(gid2.x + gid2.y * nwg.x * 256u, 0u, 0u);
     let i = gid.x;
     if (i >= params.total) { return; }
 
-    let ndim = params.ndim;
-    // shape_data layout: out_shape[ndim], a_strides[ndim], b_strides[ndim], out_strides[ndim]
-    var ai: u32 = 0u;
-    var bi: u32 = 0u;
-    var rem = i;
-    for (var d: u32 = 0u; d < ndim; d = d + 1u) {
-        let out_stride = shape_data[3u * ndim + d];
-        let coord = rem / out_stride;
-        rem = rem % out_stride;
-        ai += coord * shape_data[ndim + d];
-        bi += coord * shape_data[2u * ndim + d];
+    var ai = i;
+    var bi = i;
+    if (params.a_mode == 1u) { ai = 0u; } else if (params.a_mode == 2u) { ai = i % params.a_len; }
+    if (params.b_mode == 1u) { bi = 0u; } else if (params.b_mode == 2u) { bi = i % params.b_len; }
+    if (params.a_mode == 3u || params.b_mode == 3u) {
+        let ndim = params.ndim;
+        // shape_data layout: out_shape[ndim], a_strides[ndim], b_strides[ndim], out_strides[ndim]
+        var sa: u32 = 0u;
+        var sb: u32 = 0u;
+        var rem = i;
+        for (var d: u32 = 0u; d < ndim; d = d + 1u) {
+            let out_stride = shape_data[3u * ndim + d];
+            let coord = rem / out_stride;
+            rem = rem % out_stride;
+            sa += coord * shape_data[ndim + d];
+            sb += coord * shape_data[2u * ndim + d];
+        }
+        if (params.a_mode == 3u) { ai = sa; }
+        if (params.b_mode == 3u) { bi = sb; }
     }
 
     let va = a[ai];
@@ -189,7 +246,10 @@ struct UnaryParams {
 @group(0) @binding(2) var<uniform> params: UnaryParams;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid2: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    // Large dispatches span a 2D grid of 256-wide groups (see GpuExecutor::grid)
+    let gid = vec3<u32>(gid2.x + gid2.y * nwg.x * 256u, 0u, 0u);
     let i = gid.x;
     if (i >= params.total) { return; }
     let v = input[i];
@@ -211,7 +271,10 @@ struct SoftmaxParams {
 @group(0) @binding(2) var<uniform> params: SoftmaxParams;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid2: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    // Large dispatches span a 2D grid of 256-wide groups (see GpuExecutor::grid)
+    let gid = vec3<u32>(gid2.x + gid2.y * nwg.x * 256u, 0u, 0u);
     let idx = gid.x;
     let total_lanes = params.outer * params.inner;
     if (idx >= total_lanes) { return; }
@@ -252,7 +315,10 @@ struct ReduceParams {
 @group(0) @binding(2) var<uniform> params: ReduceParams;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid2: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    // Large dispatches span a 2D grid of 256-wide groups (see GpuExecutor::grid)
+    let gid = vec3<u32>(gid2.x + gid2.y * nwg.x * 256u, 0u, 0u);
     let idx = gid.x;
     let total_lanes = params.outer * params.inner;
     if (idx >= total_lanes) { return; }
@@ -282,7 +348,10 @@ struct TransposeParams {
 @group(0) @binding(3) var<storage, read> shape_data: array<u32>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid2: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    // Large dispatches span a 2D grid of 256-wide groups (see GpuExecutor::grid)
+    let gid = vec3<u32>(gid2.x + gid2.y * nwg.x * 256u, 0u, 0u);
     let i = gid.x;
     if (i >= params.total) { return; }
 
@@ -311,7 +380,10 @@ struct GatherParams {
 @group(0) @binding(3) var<uniform> params: GatherParams;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid2: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    // Large dispatches span a 2D grid of 256-wide groups (see GpuExecutor::grid)
+    let gid = vec3<u32>(gid2.x + gid2.y * nwg.x * 256u, 0u, 0u);
     let total = params.outer * params.idx_count * params.inner;
     if (gid.x >= total) { return; }
 
@@ -342,7 +414,10 @@ struct ConcatParams {
 @group(0) @binding(2) var<uniform> params: ConcatParams;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid2: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    // Large dispatches span a 2D grid of 256-wide groups (see GpuExecutor::grid)
+    let gid = vec3<u32>(gid2.x + gid2.y * nwg.x * 256u, 0u, 0u);
     let total = params.outer * params.in_axis * params.inner;
     if (gid.x >= total) { return; }
 
@@ -371,7 +446,10 @@ struct SliceParams {
 @group(0) @binding(3) var<storage, read> shape_data: array<u32>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid2: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    // Large dispatches span a 2D grid of 256-wide groups (see GpuExecutor::grid)
+    let gid = vec3<u32>(gid2.x + gid2.y * nwg.x * 256u, 0u, 0u);
     let i = gid.x;
     if (i >= params.total) { return; }
 
@@ -400,7 +478,10 @@ struct TileParams {
 @group(0) @binding(3) var<storage, read> shape_data: array<u32>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid2: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    // Large dispatches span a 2D grid of 256-wide groups (see GpuExecutor::grid)
+    let gid = vec3<u32>(gid2.x + gid2.y * nwg.x * 256u, 0u, 0u);
     let i = gid.x;
     if (i >= params.total) { return; }
 
@@ -429,16 +510,22 @@ struct ConvParams {
     h_out: u32, w_out: u32,
     patch_sz: u32,
     n_patches: u32,
-    _pad: u32,
+    n_batch: u32,
 }
 @group(0) @binding(2) var<uniform> params: ConvParams;
 
+// Output layout: [n_batch * n_patches, patch_sz]
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let total = params.n_patches * params.patch_sz;
+fn main(@builtin(global_invocation_id) gid2: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+    // Large dispatches span a 2D grid of 256-wide groups (see GpuExecutor::grid)
+    let gid = vec3<u32>(gid2.x + gid2.y * nwg.x * 256u, 0u, 0u);
+    let total = params.n_batch * params.n_patches * params.patch_sz;
     if (gid.x >= total) { return; }
 
-    let pi = gid.x / params.patch_sz;
+    let per_img = params.n_patches * params.patch_sz;
+    let img = gid.x / per_img;
+    let pi = (gid.x % per_img) / params.patch_sz;
     let fi = gid.x % params.patch_sz;
     let py = pi / params.w_out;
     let px = pi % params.w_out;
@@ -449,7 +536,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let ys = py * params.sh + ky;
     let xs = px * params.sw + kx;
-    col[gid.x] = input[c * params.h * params.w + ys * params.w + xs];
+    let in_base = img * params.c_in * params.h * params.w;
+    col[gid.x] = input[in_base + c * params.h * params.w + ys * params.w + xs];
 }
 ";
 
@@ -504,48 +592,71 @@ impl Pipelines {
 
 // ── GPU Executor ─────────────────────────────────────────────────────────────
 
+/// Graph nodes recorded per command-buffer submission.
+const FLUSH_EVERY: usize = 32;
+
 pub struct GpuExecutor {
     ctx: GpuContext,
     pipelines: Pipelines,
     weight_cache: HashMap<String, GpuTensor>,
+    /// First device error since the last check. wgpu's default handler panics;
+    /// ours records the error so `run` can fail cleanly (e.g. out of VRAM).
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl GpuExecutor {
     pub fn new(ctx: GpuContext) -> Self {
+        let error = Arc::new(Mutex::new(None));
+        let slot = error.clone();
+        ctx.device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+            let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.is_none() {
+                *slot = Some(error_chain(&e));
+            }
+        }));
         let pipelines = Pipelines::new(&ctx.device);
-        GpuExecutor { ctx, pipelines, weight_cache: HashMap::new() }
+        GpuExecutor { ctx, pipelines, weight_cache: HashMap::new(), error }
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    fn has_error(&self) -> bool {
+        self.error.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+    }
+
+    /// Create a buffer and fill it via the queue. (`create_buffer_init` maps the
+    /// buffer at creation, which panics instead of reporting when allocation fails.)
+    fn upload_bytes(&self, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        let size = (data.len() as u64).max(4).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+        let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if !data.is_empty() {
+            self.ctx.queue.write_buffer(&buffer, 0, data);
+        }
+        buffer
     }
 
     fn upload_f32(&self, data: &[f32]) -> wgpu::Buffer {
-        self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck_cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-        })
+        self.upload_bytes(bytemuck_cast_slice(data),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC)
     }
 
     fn upload_i32(&self, data: &[i32]) -> wgpu::Buffer {
-        self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck_cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        })
+        self.upload_bytes(bytemuck_cast_slice(data), wgpu::BufferUsages::STORAGE)
     }
 
     fn upload_u32(&self, data: &[u32]) -> wgpu::Buffer {
-        self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck_cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        })
+        self.upload_bytes(bytemuck_cast_slice(data), wgpu::BufferUsages::STORAGE)
     }
 
     fn create_uniform(&self, data: &[u8]) -> wgpu::Buffer {
-        self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: data,
-            usage: wgpu::BufferUsages::UNIFORM,
-        })
+        self.upload_bytes(data, wgpu::BufferUsages::UNIFORM)
     }
 
     fn create_storage(&self, size: u64) -> wgpu::Buffer {
@@ -573,11 +684,18 @@ impl GpuExecutor {
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).ok(); });
         self.ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        rx.recv().unwrap().unwrap();
-
-        let data = slice.get_mapped_range();
-        let result: Vec<f32> = data.chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        // Any earlier failure (e.g. allocating `staging`) makes the data meaningless
+        let mapped = match rx.recv() {
+            Ok(Ok(())) if !self.has_error() => slice.get_mapped_range().ok(),
+            _ => None,
+        };
+        let Some(data) = mapped else {
+            let mut slot = self.error.lock().unwrap_or_else(|p| p.into_inner());
+            slot.get_or_insert_with(|| "failed to map result buffer".into());
+            return vec![0.0; len];
+        };
+        let result: Vec<f32> = data.as_chunks::<4>().0.iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         drop(data);
         staging.unmap();
@@ -585,7 +703,7 @@ impl GpuExecutor {
     }
 
     fn upload_tensor(&self, t: &Tensor) -> GpuTensor {
-        GpuTensor { shape: t.shape.clone(), buffer: self.upload_f32(t.as_f32()) }
+        GpuTensor { shape: t.shape.clone(), buffer: self.upload_f32(&t.f32_data()) }
     }
 
     fn ensure_weights_cached(&mut self, model: &OnnxModel) {
@@ -607,7 +725,15 @@ impl GpuExecutor {
         }
     }
 
-    fn div_ceil(a: u32, b: u32) -> u32 { (a + b - 1) / b }
+    fn div_ceil(a: u32, b: u32) -> u32 { a.div_ceil(b) }
+
+    /// Workgroup grid for `threads` invocations of a 256-wide 1D shader. Each
+    /// dimension is capped at 65535 groups, so large tensors spill into y.
+    fn grid(threads: u32) -> (u32, u32, u32) {
+        let groups = Self::div_ceil(threads, 256).max(1);
+        let x = groups.min(65535);
+        (x, Self::div_ceil(groups, x), 1)
+    }
 
     fn dispatch(&self, pipeline: &wgpu::ComputePipeline, buffers: &[&wgpu::Buffer],
                 workgroups: (u32, u32, u32), enc: &mut Option<wgpu::CommandEncoder>) {
@@ -642,9 +768,9 @@ impl GpuExecutor {
         // Batch strides: 0 if that operand has no batch dims (broadcast)
         let a_batch_elems: usize = a_batch.iter().product::<usize>().max(1);
         let b_batch_elems: usize = b_batch.iter().product::<usize>().max(1);
-        let a_batch_stride = if a_batch_elems > 1 { (m * k) as u32 } else { 0 };
-        let b_batch_stride = if b_batch_elems > 1 { (k * n) as u32 } else { 0 };
-        let c_batch_stride = (m * n) as u32;
+        let a_batch_stride = if a_batch_elems > 1 { m * k } else { 0 };
+        let b_batch_stride = if b_batch_elems > 1 { k * n } else { 0 };
+        let c_batch_stride = m * n;
         let out_len = (batch * m * n) as usize;
         let out_buf = self.create_storage((out_len * 4) as u64);
 
@@ -652,7 +778,7 @@ impl GpuExecutor {
         let param_buf = self.create_uniform(bytemuck_cast_slice(&params));
         self.dispatch(&self.pipelines.matmul,
             &[&a.buffer, &b.buffer, &out_buf, &param_buf],
-            (Self::div_ceil(n, 16), Self::div_ceil(m, 16), batch), enc);
+            (Self::div_ceil(n, 64), Self::div_ceil(m, 64), batch), enc);
 
         let mut shape = out_batch;
         shape.push(m as usize);
@@ -666,23 +792,28 @@ impl GpuExecutor {
         let alpha = node.attr_f("alpha").unwrap_or(1.0);
         let beta = node.attr_f("beta").unwrap_or(1.0);
 
-        // Flush pending GPU work before downloading
-        self.flush(enc);
+        if alpha != 1.0 || beta != 1.0 {
+            // Rare: scaled GEMM — CPU fallback
+            self.flush(enc);
+            let a_cpu = Tensor::f32(a.shape.clone(), self.download_f32(&a.buffer, a.numel()));
+            let b_cpu = Tensor::f32(b.shape.clone(), self.download_f32(&b.buffer, b.numel()));
+            let c_cpu = c.map(|ct| Tensor::f32(ct.shape.clone(), self.download_f32(&ct.buffer, ct.numel())));
+            let result = crate::onnx::cpu_gemm(&a_cpu, &b_cpu, c_cpu.as_ref(), trans_a, trans_b, alpha, beta);
+            return self.upload_tensor(&result);
+        }
 
-        let a_data = self.download_f32(&a.buffer, a.numel());
-        let b_data = self.download_f32(&b.buffer, b.numel());
-        let a_cpu = Tensor::f32(a.shape.clone(), a_data);
-        let b_cpu = Tensor::f32(b.shape.clone(), b_data);
-        let c_cpu = c.map(|ct| {
-            let cd = self.download_f32(&ct.buffer, ct.numel());
-            Tensor::f32(ct.shape.clone(), cd)
-        });
-
-        // Build a fake node with the attrs
-        let result = crate::onnx::cpu_gemm(&a_cpu, &b_cpu, c_cpu.as_ref(), trans_a, trans_b, alpha, beta);
-        self.upload_tensor(&result)
+        let a_t;
+        let a = if trans_a { a_t = self.op_transpose(a, &[1, 0], enc); &a_t } else { a };
+        let b_t;
+        let b = if trans_b { b_t = self.op_transpose(b, &[1, 0], enc); &b_t } else { b };
+        let out = self.op_matmul(a, b, enc);
+        match c {
+            Some(bias) => self.op_binary(&out, bias, 0, enc),
+            None => out,
+        }
     }
 
+    /// Conv as im2col + GEMM, entirely on the GPU: col [B·P, patch] × Wᵀ [patch, C] → [B, P, C] → [B, C, P].
     fn op_conv(&self, input: &GpuTensor, weight: &GpuTensor, bias: Option<&GpuTensor>, node: &Node, enc: &mut Option<wgpu::CommandEncoder>) -> GpuTensor {
         let n_batch = input.shape[0];
         let c_in = input.shape[1] as u32;
@@ -700,39 +831,23 @@ impl GpuExecutor {
         let patch = c_in * kh * kw;
         let n_patches = h_out * w_out;
 
-        // Phase 1: im2col on GPU
-        let col_len = (n_patches * patch) as usize;
+        let col_len = n_batch * (n_patches * patch) as usize;
         let col_buf = self.create_storage((col_len * 4) as u64);
-
-        let conv_params: [u32; 12] = [c_in, h, w, kh, kw, sh, sw, h_out, w_out, patch, n_patches, 0];
+        let conv_params: [u32; 12] = [c_in, h, w, kh, kw, sh, sw, h_out, w_out, patch, n_patches, n_batch as u32];
         let param_buf = self.create_uniform(bytemuck_cast_slice(&conv_params));
         self.dispatch(&self.pipelines.conv_im2col,
             &[&input.buffer, &col_buf, &param_buf],
-            (Self::div_ceil(n_patches * patch, 256), 1, 1), enc);
+            Self::grid(col_len as u32), enc);
+        let col = GpuTensor { shape: vec![n_batch * n_patches as usize, patch as usize], buffer: col_buf };
 
-        // Flush so im2col result is available for CPU BLAS
-        self.flush(enc);
-
-        let col_data = self.download_f32(&col_buf, col_len);
-        let w_data = self.download_f32(&weight.buffer, weight.numel());
-
-        // weight [c_out, patch] × col^T [patch, n_patches]
-        let w_tensor = Tensor::f32(vec![c_out, patch as usize], w_data);
-        let col_tensor = Tensor::f32(vec![n_patches as usize, patch as usize], col_data);
-        let result_cpu = crate::onnx::cpu_gemm(&w_tensor, &col_tensor, None, false, true, 1.0, 0.0);
-        let mut out = result_cpu.as_f32().to_vec();
-
+        let w_t = self.op_transpose(&weight.reshape(vec![c_out, patch as usize]), &[1, 0], enc);
+        let mut out = self.op_matmul(&col, &w_t, enc);
         if let Some(bias) = bias {
-            let b = self.download_f32(&bias.buffer, bias.numel());
-            for j in 0..c_out {
-                let row = &mut out[j * n_patches as usize..(j + 1) * n_patches as usize];
-                let bj = b[j];
-                for v in row { *v += bj; }
-            }
+            out = self.op_binary(&out, bias, 0, enc);
         }
-
-        let result = Tensor::f32(vec![n_batch, c_out, h_out as usize, w_out as usize], out);
-        self.upload_tensor(&result)
+        let out = out.reshape(vec![n_batch, n_patches as usize, c_out]);
+        let out = self.op_transpose(&out, &[0, 2, 1], enc);
+        out.reshape(vec![n_batch, c_out, h_out as usize, w_out as usize])
     }
 
     fn op_binary(&self, a: &GpuTensor, b: &GpuTensor, opcode: u32, enc: &mut Option<wgpu::CommandEncoder>) -> GpuTensor {
@@ -752,13 +867,29 @@ impl GpuExecutor {
         shape_data.extend_from_slice(&b_strides);
         shape_data.extend_from_slice(&out_strides);
 
-        let params: [u32; 4] = [total, ndim, opcode, 0];
+        // Cheap indexing when the operand is the full output, a scalar, or a
+        // contiguous trailing block (LayerNorm γ/β, biases) — the common cases
+        let mode = |shape: &[usize]| -> (u32, u32) {
+            let len: usize = shape.iter().product::<usize>().max(1);
+            if len == 1 {
+                (1, 1)
+            } else if len as u32 == total {
+                (0, len as u32)
+            } else if out_shape.ends_with(&shape[shape.iter().position(|&d| d != 1).unwrap_or(0)..]) {
+                (2, len as u32)
+            } else {
+                (3, len as u32)
+            }
+        };
+        let (a_mode, a_len) = mode(&a.shape);
+        let (b_mode, b_len) = mode(&b.shape);
+        let params: [u32; 8] = [total, ndim, opcode, a_mode, b_mode, a_len, b_len, 0];
         let param_buf = self.create_uniform(bytemuck_cast_slice(&params));
         let shape_buf = self.upload_u32(&shape_data);
         let out_buf = self.create_storage((total as u64) * 4);
         self.dispatch(&self.pipelines.binary,
             &[&a.buffer, &b.buffer, &out_buf, &param_buf, &shape_buf],
-            (Self::div_ceil(total, 256), 1, 1), enc);
+            Self::grid(total), enc);
         GpuTensor { shape: out_shape, buffer: out_buf }
     }
 
@@ -768,7 +899,7 @@ impl GpuExecutor {
         let params: [u32; 2] = [total, opcode];
         let param_buf = self.create_uniform(bytemuck_cast_slice(&params));
         self.dispatch(&self.pipelines.unary, &[&a.buffer, &out_buf, &param_buf],
-            (Self::div_ceil(total, 256), 1, 1), enc);
+            Self::grid(total), enc);
         GpuTensor { shape: a.shape.clone(), buffer: out_buf }
     }
 
@@ -781,7 +912,7 @@ impl GpuExecutor {
         let params: [u32; 4] = [outer, dim, inner, 0];
         let param_buf = self.create_uniform(bytemuck_cast_slice(&params));
         self.dispatch(&self.pipelines.softmax, &[&a.buffer, &out_buf, &param_buf],
-            (Self::div_ceil(outer * inner, 256), 1, 1), enc);
+            Self::grid(outer * inner), enc);
         GpuTensor { shape: a.shape.clone(), buffer: out_buf }
     }
 
@@ -808,7 +939,7 @@ impl GpuExecutor {
             let params: [u32; 4] = [outer, dim, inner, 0];
             let param_buf = self.create_uniform(bytemuck_cast_slice(&params));
             self.dispatch(&self.pipelines.reduce_mean, &[&a.buffer, &out_buf, &param_buf],
-                (Self::div_ceil(outer * inner, 256), 1, 1), enc);
+                Self::grid(outer * inner), enc);
             return GpuTensor { shape: out_shape, buffer: out_buf };
         }
 
@@ -839,7 +970,7 @@ impl GpuExecutor {
         let param_buf = self.create_uniform(bytemuck_cast_slice(&params));
         self.dispatch(&self.pipelines.transpose,
             &[&a.buffer, &out_buf, &param_buf, &shape_buf],
-            (Self::div_ceil(total, 256), 1, 1), enc);
+            Self::grid(total), enc);
         GpuTensor { shape: out_shape, buffer: out_buf }
     }
 
@@ -865,7 +996,7 @@ impl GpuExecutor {
         let param_buf = self.create_uniform(bytemuck_cast_slice(&params));
         self.dispatch(&self.pipelines.gather,
             &[&data.buffer, &idx_buf, &out_buf, &param_buf],
-            (Self::div_ceil(total as u32, 256), 1, 1), enc);
+            Self::grid(total as u32), enc);
         GpuTensor { shape: out_shape, buffer: out_buf }
     }
 
@@ -889,7 +1020,7 @@ impl GpuExecutor {
             let params: [u32; 8] = [outer, in_axis, out_axis, inner, axis_offset, 0, 0, 0];
             let param_buf = self.create_uniform(bytemuck_cast_slice(&params));
             self.dispatch(&self.pipelines.concat, &[&t.buffer, &out_buf, &param_buf],
-                (Self::div_ceil(total, 256), 1, 1), enc);
+                Self::grid(total), enc);
             axis_offset += in_axis;
         }
 
@@ -915,7 +1046,7 @@ impl GpuExecutor {
             if e < 0 { e += dim; }
             s = s.clamp(0, dim);
             e = e.clamp(0, dim);
-            let len = if e > s { ((e - s) as u32 + step - 1) / step } else { 0 };
+            let len = if e > s { ((e - s) as u32).div_ceil(step) } else { 0 };
             slice_start[axis] = s as u32;
             slice_step[axis] = step;
             out_shape[axis] = len as usize;
@@ -938,7 +1069,7 @@ impl GpuExecutor {
         let param_buf = self.create_uniform(bytemuck_cast_slice(&params));
         self.dispatch(&self.pipelines.slice,
             &[&data.buffer, &out_buf, &param_buf, &shape_buf],
-            (Self::div_ceil(total, 256), 1, 1), enc);
+            Self::grid(total), enc);
 
         GpuTensor { shape: out_shape, buffer: out_buf }
     }
@@ -964,14 +1095,30 @@ impl GpuExecutor {
         let param_buf = self.create_uniform(bytemuck_cast_slice(&params));
         self.dispatch(&self.pipelines.tile,
             &[&data.buffer, &out_buf, &param_buf, &shape_buf],
-            (Self::div_ceil(total, 256), 1, 1), enc);
+            Self::grid(total), enc);
         GpuTensor { shape: out_shape, buffer: out_buf }
     }
 
     // ── Graph executor ───────────────────────────────────────────────────
 
+    /// Run the graph on the GPU. Device errors (out of memory, limits exceeded)
+    /// come back as `Err`; cached weights are dropped so a retry starts clean.
     pub fn run(&mut self, model: &OnnxModel, inputs: Vec<(&str, Tensor)>) -> Result<HashMap<String, Tensor>> {
+        self.take_error();
+        let result = self.run_graph(model, inputs);
+        if let Some(e) = self.take_error() {
+            // Buffers created during a failed pass may be invalid; don't reuse them.
+            // (wgpu keeps the failed pass's VRAM reserved — callers retrying with
+            // less memory should recreate the executor, see backends.rs.)
+            self.weight_cache.clear();
+            bail!("GPU error: {e}");
+        }
+        result
+    }
+
+    fn run_graph(&mut self, model: &OnnxModel, inputs: Vec<(&str, Tensor)>) -> Result<HashMap<String, Tensor>> {
         self.ensure_weights_cached(model);
+        if self.has_error() { bail!("uploading weights failed"); }
 
         let mut gpu_tensors: HashMap<String, GpuTensor> = HashMap::new();
         let mut cpu_tensors: HashMap<String, Tensor> = HashMap::new();
@@ -1066,16 +1213,7 @@ impl GpuExecutor {
                     let shape_tensor = get_cpu(1)
                         .with_context(|| format!("Reshape needs i64 shape tensor, node {}", i))?;
                     if let Some(a) = get_gpu(0) {
-                        let shape_vals = shape_tensor.as_i64();
-                        let total: usize = a.numel();
-                        let mut new_shape: Vec<usize> = shape_vals.iter().map(|&v| {
-                            if v == 0 { 1 } else if v == -1 { 0 } else { v as usize }
-                        }).collect();
-                        let known: usize = new_shape.iter().filter(|&&v| v != 0).product::<usize>().max(1);
-                        for v in &mut new_shape {
-                            if *v == 0 { *v = total / known; }
-                        }
-                        let result = a.reshape(new_shape);
+                        let result = a.reshape(crate::onnx::reshape_dims(&a.shape, shape_tensor.as_i64()));
                         gpu_tensors.insert(out_name.clone(), result);
                     } else {
                         let a_cpu = get_cpu(0).with_context(|| format!("Reshape: no input, node {}", i))?;
@@ -1148,12 +1286,12 @@ impl GpuExecutor {
                         !name.is_empty() && (cpu_tensors.contains_key(name) || model.weights.get(name).map(|t| !t.is_f32()).unwrap_or(false))
                     });
                     if all_cpu {
-                        let ts: Vec<&Tensor> = (0..node.inputs.len()).filter_map(|j| get_cpu(j)).collect();
+                        let ts: Vec<&Tensor> = (0..node.inputs.len()).filter_map(&get_cpu).collect();
                         let result = crate::onnx::cpu_concat(&ts, axis);
                         cpu_tensors.insert(out_name.clone(), result);
                     } else {
                         let ts: Vec<&GpuTensor> = (0..node.inputs.len())
-                            .filter_map(|j| get_gpu(j))
+                            .filter_map(&get_gpu)
                             .collect();
                         let result = self.op_concat(&ts, axis, &mut enc);
                         gpu_tensors.insert(out_name.clone(), result);
@@ -1207,6 +1345,15 @@ impl GpuExecutor {
                     let dims: Vec<i64> = shape.iter().map(|&s| s as i64).collect();
                     cpu_tensors.insert(out_name.clone(), Tensor::i64(vec![dims.len()], dims));
                 }
+                "Cast" => {
+                    if let Some(a) = get_gpu(0) {
+                        crate::onnx::check_cast(node, true)?;
+                        gpu_tensors.insert(out_name.clone(), a.reshape(a.shape.clone()));
+                    } else {
+                        let a_cpu = get_cpu(0).with_context(|| format!("Cast: no input, node {}", i))?;
+                        cpu_tensors.insert(out_name.clone(), crate::onnx::op_cast(a_cpu, node)?);
+                    }
+                }
                 "Tile" => {
                     let data = get_gpu(0).with_context(|| format!("missing input for Tile node {}", i))?;
                     let repeats_t = get_cpu(1)
@@ -1223,6 +1370,13 @@ impl GpuExecutor {
                     gpu_tensors.remove(name);
                     cpu_tensors.remove(name);
                 }
+            }
+
+            // Dropped buffers are only reclaimed once the work using them has run,
+            // so submit periodically to bound peak VRAM (one transformer layer ≈ 54 nodes)
+            if i % FLUSH_EVERY == FLUSH_EVERY - 1 {
+                self.flush(&mut enc);
+                if self.has_error() { bail!("aborted at node {i}"); }
             }
         }
 
@@ -1245,12 +1399,28 @@ impl GpuExecutor {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/// One line: error kind plus its most specific cause, e.g.
+/// "Out of Memory: Not enough memory left." (wgpu's Display spans several lines).
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let first_line = |s: String| s.lines().next().unwrap_or("").trim().to_string();
+    let mut innermost = None;
+    let mut src = e.source();
+    while let Some(s) = src {
+        innermost = Some(s);
+        src = s.source();
+    }
+    match innermost {
+        Some(cause) => format!("{}: {}", first_line(e.to_string()), first_line(cause.to_string())),
+        None => first_line(e.to_string()),
+    }
+}
+
 /// Byte casting for &[u32] / &[f32] / &[i32] → &[u8] (avoids direct bytemuck dep)
 fn bytemuck_cast_slice<T: Copy>(data: &[T]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(
             data.as_ptr() as *const u8,
-            data.len() * std::mem::size_of::<T>(),
+            std::mem::size_of_val(data),
         )
     }
 }
@@ -1285,6 +1455,27 @@ mod tests {
         assert_eq!(data, out);
     }
 
+    /// Device errors (here: buffers over the device limit, like running out of
+    /// VRAM) must come back as Err instead of panicking, and a fresh executor
+    /// must work afterwards.
+    #[test]
+    #[ignore]
+    fn gpu_error_is_returned_not_panicked() {
+        let Some(ctx) = GpuContext::with_buffer_limit(Some(1 << 20)) else { return };
+        let mut exec = GpuExecutor::new(ctx);
+        let model = OnnxModel::load(&model_dir().join("siglip2_image.onnx")).expect("load");
+        let input = || Tensor::f32(vec![1, 3, 224, 224], vec![0.1f32; 3 * 224 * 224]);
+        let err = exec.run(&model, vec![("pixel_values", input())]).err().expect("should fail");
+        eprintln!("{err:#}");
+        assert!(format!("{err:#}").contains("GPU error"), "{err:#}");
+        // The same executor reports (not panics) on the next try as well
+        assert!(exec.run(&model, vec![("pixel_values", input())]).is_err());
+
+        let mut fresh = GpuExecutor::new(GpuContext::try_new().unwrap());
+        let out = fresh.run(&model, vec![("pixel_values", input())]).expect("fresh device");
+        assert_eq!(out["pooler_output"].shape, vec![1, 768]);
+    }
+
     #[test]
     #[ignore]
     fn gpu_cpu_image_match() {
@@ -1298,6 +1489,41 @@ mod tests {
         let c = cosine(gpu["pooler_output"].as_f32(), cpu["pooler_output"].as_f32());
         eprintln!("image cosine: {c:.6}");
         assert!(c > 0.999, "diverge: {c}");
+    }
+
+    /// Batched GPU inference (Conv, Reshape, attention pooling over B > 1, and
+    /// matmuls larger than one 64x64 tile) must equal per-image CPU inference —
+    /// for every installed model, including the fp16 ones.
+    #[test]
+    #[ignore]
+    fn gpu_batch_matches_cpu_singles() {
+        let data_dir = model_dir().parent().unwrap().to_path_buf();
+        let mut tested = 0;
+        for m in crate::models::MODELS {
+            let path = m.image_model(&data_dir);
+            if !path.exists() { eprintln!("{}: not installed, skipped", m.name); continue; }
+            let ctx = match GpuContext::try_new() { Some(c) => c, None => return };
+            let mut exec = GpuExecutor::new(ctx);
+            let model = OnnxModel::load(&path).expect("load");
+            let n = 3 * m.image_size * m.image_size;
+            let imgs: Vec<Vec<f32>> = (0..3).map(|k| {
+                (0..n).map(|i| (((i * (k + 1) * 7919) % 1000) as f32 / 1000.0) - 0.5).collect()
+            }).collect();
+            let batch = Tensor::f32(vec![3, 3, m.image_size, m.image_size], imgs.concat());
+            let gpu = exec.run(&model, vec![("pixel_values", batch)]).expect("gpu");
+            let pooled = &gpu["pooler_output"];
+            assert_eq!(pooled.shape, vec![3, m.dims], "{}", m.name);
+            for (k, img) in imgs.into_iter().enumerate() {
+                let single = Tensor::f32(vec![1, 3, m.image_size, m.image_size], img);
+                let cpu = crate::onnx::run(&model, vec![("pixel_values", single)]).expect("cpu");
+                let got = &pooled.as_f32()[k * m.dims..(k + 1) * m.dims];
+                let c = cosine(got, cpu["pooler_output"].as_f32());
+                eprintln!("{} batch item {k} cosine: {c:.6}", m.name);
+                assert!(c > 0.999, "{} item {k} diverges: {c}", m.name);
+            }
+            tested += 1;
+        }
+        assert!(tested > 0, "no models installed");
     }
 
     #[test]

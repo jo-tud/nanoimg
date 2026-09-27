@@ -1,0 +1,154 @@
+[
+ {
+  "text": "a fish",
+  "cat": "fish"
+ },
+ {
+  "text": "Angler hält einen Fisch",
+  "cat": "fish"
+ },
+ {
+  "text": "tench",
+  "cat": "fish"
+ },
+ {
+  "text": "a dog",
+  "cat": "dog"
+ },
+ {
+  "text": "ein Hund im Gras",
+  "cat": "dog"
+ },
+ {
+  "text": "spaniel",
+  "cat": "dog"
+ },
+ {
+  "text": "cassette player",
+  "cat": "cassette"
+ },
+ {
+  "text": "alter Kassettenrekorder",
+  "cat": "cassette"
+ },
+ {
+  "text": "chainsaw",
+  "cat": "chainsaw"
+ },
+ {
+  "text": "Kettensäge",
+  "cat": "chainsaw"
+ },
+ {
+  "text": "a man cutting wood with a chainsaw",
+  "cat": "chainsaw"
+ },
+ {
+  "text": "church",
+  "cat": "church"
+ },
+ {
+  "text": "Kirche mit Turm",
+  "cat": "church"
+ },
+ {
+  "text": "french horn",
+  "cat": "horn"
+ },
+ {
+  "text": "Waldhorn",
+  "cat": "horn"
+ },
+ {
+  "text": "garbage truck",
+  "cat": "garbagetruck"
+ },
+ {
+  "text": "Müllauto",
+  "cat": "garbagetruck"
+ },
+ {
+  "text": "gas station pump",
+  "cat": "gaspump"
+ },
+ {
+  "text": "Zapfsäule",
+  "cat": "gaspump"
+ },
+ {
+  "text": "golf ball",
+  "cat": "golfball"
+ },
+ {
+  "text": "Golfball",
+  "cat": "golfball"
+ },
+ {
+  "text": "a golf ball on the grass",
+  "cat": "golfball"
+ },
+ {
+  "text": "parachute",
+  "cat": "parachute"
+ },
+ {
+  "text": "Fallschirmspringer am Himmel",
+  "cat": "parachute"
+ },
+ {
+  "text": "Musikinstrument",
+  "cat": "horn"
+ },
+ {
+  "text": "vehicle for collecting trash",
+  "cat": "garbagetruck"
+ },
+ {
+  "text": "a cat",
+  "cat": null
+ },
+ {
+  "text": "Katze",
+  "cat": null
+ },
+ {
+  "text": "beach at sunset",
+  "cat": null
+ },
+ {
+  "text": "Strand",
+  "cat": null
+ },
+ {
+  "text": "birthday cake",
+  "cat": null
+ },
+ {
+  "text": "Geburtstagstorte",
+  "cat": null
+ },
+ {
+  "text": "snowy mountains",
+  "cat": null
+ },
+ {
+  "text": "Berge im Schnee",
+  "cat": null
+ },
+ {
+  "text": "a laptop computer",
+  "cat": null
+ },
+ {
+  "text": "Hochzeit",
+  "cat": null
+ },
+ {
+  "text": "elephant",
+  "cat": null
+ },
+ {
+  "text": "Pizza",
+  "cat": null
+ }
+]

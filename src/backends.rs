@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use image::DynamicImage;
+use rayon::prelude::*;
 use std::path::Path;
 
 use crate::onnx::{self, OnnxModel, Tensor};
@@ -8,7 +9,8 @@ use crate::tokenizer::BpeTokenizer;
 // ── Traits ────────────────────────────────────────────────────────────────────
 
 pub trait Embedder: Send + Sync {
-    fn embed(&self, img: &DynamicImage) -> Result<Vec<f32>>;
+    /// One L2-normalized embedding per image, in order.
+    fn embed_batch(&self, imgs: &[DynamicImage]) -> Result<Vec<Vec<f32>>>;
 }
 
 pub trait TextEmbedder: Send + Sync {
@@ -17,34 +19,58 @@ pub trait TextEmbedder: Send + Sync {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-pub fn l2_normalize(v: &mut Vec<f32>) {
+pub fn l2_normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-6 {
         for x in v.iter_mut() { *x /= norm; }
     }
 }
 
-pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-
 // ── SigLIP2 image embedder ──────────────────────────────────────────────────
 
 pub struct SigLIP2ImageEmbedder {
     model: OnnxModel,
+    /// Square input resolution the vision tower was trained at
+    size: usize,
+    /// None once no GPU was found or it failed even at batch size 1
     #[cfg(feature = "gpu")]
-    gpu: Option<std::sync::Mutex<crate::gpu::GpuExecutor>>,
+    gpu: std::sync::Mutex<Option<GpuRunner>>,
+}
+
+#[cfg(feature = "gpu")]
+struct GpuRunner {
+    exec: Option<crate::gpu::GpuExecutor>,
+    /// Images per forward pass; halved whenever a pass fails (out of VRAM)
+    batch: usize,
+}
+
+#[cfg(feature = "gpu")]
+impl GpuRunner {
+    /// Replace the device. wgpu keeps a failed pass's VRAM reserved, so a retry
+    /// on the same device fails even at sizes that normally fit.
+    fn reset(&mut self) -> Result<()> {
+        self.exec = None; // release the old device's memory first
+        let ctx = crate::gpu::GpuContext::try_new().context("GPU unavailable")?;
+        self.exec = Some(crate::gpu::GpuExecutor::new(ctx));
+        Ok(())
+    }
 }
 
 impl SigLIP2ImageEmbedder {
-    pub fn load(model_path: &Path) -> Result<Self> {
+    pub fn load(model_path: &Path, size: usize, #[allow(unused)] gpu_batch: usize) -> Result<Self> {
         let model = OnnxModel::load(model_path)
             .context("load siglip2 image model")?;
 
+        // NANOIMG_GPU_BATCH overrides the model default (tuning, small GPUs)
+        #[cfg(feature = "gpu")]
+        let batch = std::env::var("NANOIMG_GPU_BATCH").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(gpu_batch)
+            .max(1);
         #[cfg(feature = "gpu")]
         let gpu = crate::gpu::GpuContext::try_new().map(|ctx| {
             eprintln!("GPU: {}", ctx.name);
-            std::sync::Mutex::new(crate::gpu::GpuExecutor::new(ctx))
+            GpuRunner { exec: Some(crate::gpu::GpuExecutor::new(ctx)), batch }
         });
         #[cfg(feature = "gpu")]
         if gpu.is_none() {
@@ -53,18 +79,21 @@ impl SigLIP2ImageEmbedder {
 
         Ok(Self {
             model,
+            size,
             #[cfg(feature = "gpu")]
-            gpu,
+            gpu: std::sync::Mutex::new(gpu),
         })
     }
 
-    fn preprocess(img: &DynamicImage) -> Vec<f32> {
+    /// Squash to size×size (no crop, as the SigLIP2 processor does), scale to [-1, 1], CHW.
+    fn preprocess(&self, img: &DynamicImage) -> Vec<f32> {
         use image::imageops::FilterType;
-        let rgb = img.resize_exact(224, 224, FilterType::Triangle).to_rgb8();
-        let mut chw = vec![0f32; 3 * 224 * 224];
+        let n = self.size;
+        let rgb = img.resize_exact(n as u32, n as u32, FilterType::Triangle).to_rgb8();
+        let mut chw = vec![0f32; 3 * n * n];
         for (x, y, pixel) in rgb.enumerate_pixels() {
             for c in 0..3 {
-                chw[c * 224 * 224 + y as usize * 224 + x as usize] =
+                chw[c * n * n + y as usize * n + x as usize] =
                     (pixel.0[c] as f32 / 255.0 - 0.5) / 0.5;
             }
         }
@@ -72,39 +101,78 @@ impl SigLIP2ImageEmbedder {
     }
 }
 
-impl Embedder for SigLIP2ImageEmbedder {
-    fn embed(&self, img: &DynamicImage) -> Result<Vec<f32>> {
-        let pixel_values = Self::preprocess(img);
-        let input = Tensor::f32(vec![1, 3, 224, 224], pixel_values);
+fn pooled_embeddings(outputs: &std::collections::HashMap<String, Tensor>) -> Result<Vec<Vec<f32>>> {
+    let pooler = outputs.get("pooler_output").context("missing pooler_output")?;
+    let dim = *pooler.shape.last().context("pooler_output has no dims")?;
+    Ok(pooler.as_f32().chunks_exact(dim).map(|v| {
+        let mut v = v.to_vec();
+        l2_normalize(&mut v);
+        v
+    }).collect())
+}
 
+impl Embedder for SigLIP2ImageEmbedder {
+    fn embed_batch(&self, imgs: &[DynamicImage]) -> Result<Vec<Vec<f32>>> {
         #[cfg(feature = "gpu")]
-        if let Some(ref gpu) = self.gpu {
-            let outputs = gpu.lock().unwrap().run(&self.model, vec![("pixel_values", input)])
-                .context("gpu run image model")?;
-            let pooler = outputs.get("pooler_output")
-                .context("missing pooler_output")?;
-            let mut v = pooler.as_f32().to_vec();
-            l2_normalize(&mut v);
-            return Ok(v);
+        {
+            let mut gpu = self.gpu.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(runner) = gpu.as_mut() {
+                match self.embed_gpu(runner, imgs) {
+                    Ok(out) => return Ok(out),
+                    Err(e) => {
+                        eprintln!("{e:#}; continuing on CPU");
+                        *gpu = None; // frees the device and its VRAM
+                    }
+                }
+            }
         }
 
-        let outputs = onnx::run(&self.model, vec![("pixel_values", input)])
-            .context("run image model")?;
-        let pooler = outputs.get("pooler_output")
-            .context("missing pooler_output")?;
-        let mut v = pooler.as_f32().to_vec();
-        l2_normalize(&mut v);
-        Ok(v)
+        // CPU: one image per rayon task keeps every core busy with small GEMMs
+        imgs.par_iter().map(|img| {
+            let input = Tensor::f32(vec![1, 3, self.size, self.size], self.preprocess(img));
+            let outputs = onnx::run(&self.model, vec![("pixel_values", input)])
+                .context("run image model")?;
+            Ok(pooled_embeddings(&outputs)?.remove(0))
+        }).collect()
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl SigLIP2ImageEmbedder {
+    /// Embed on the GPU, halving the batch size after each failed pass until it
+    /// fits. Errors only if a single image fails.
+    fn embed_gpu(&self, runner: &mut GpuRunner, imgs: &[DynamicImage]) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(imgs.len());
+        let mut done = 0;
+        while done < imgs.len() {
+            let batch = &imgs[done..(done + runner.batch).min(imgs.len())];
+            let pixels: Vec<f32> = batch.par_iter().flat_map_iter(|img| self.preprocess(img)).collect();
+            let input = Tensor::f32(vec![batch.len(), 3, self.size, self.size], pixels);
+            let exec = runner.exec.as_mut().context("GPU unavailable")?;
+            match exec.run(&self.model, vec![("pixel_values", input)]) {
+                Ok(outputs) => {
+                    out.extend(pooled_embeddings(&outputs)?);
+                    done += batch.len();
+                }
+                Err(e) if runner.batch > 1 => {
+                    runner.batch /= 2;
+                    eprintln!("{e:#}; retrying with GPU batch size {}", runner.batch);
+                    runner.reset()?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
     }
 }
 
 // ── SigLIP2 text embedder ───────────────────────────────────────────────────
 
+/// Runs on the CPU even with the `gpu` feature: a single 64-token query is faster
+/// than uploading the 1.1 GB text model to the GPU.
 pub struct SigLIP2TextEmbedder {
     model: OnnxModel,
     tokenizer: BpeTokenizer,
-    #[cfg(feature = "gpu")]
-    gpu: Option<std::sync::Mutex<crate::gpu::GpuExecutor>>,
 }
 
 impl SigLIP2TextEmbedder {
@@ -113,37 +181,15 @@ impl SigLIP2TextEmbedder {
             .context("load siglip2 text model")?;
         let tokenizer = BpeTokenizer::load(tokenizer_path)
             .context("load tokenizer")?;
-
-        #[cfg(feature = "gpu")]
-        let gpu = crate::gpu::GpuContext::try_new().map(|ctx| {
-            std::sync::Mutex::new(crate::gpu::GpuExecutor::new(ctx))
-        });
-
-        Ok(Self {
-            model,
-            tokenizer,
-            #[cfg(feature = "gpu")]
-            gpu,
-        })
+        Ok(Self { model, tokenizer })
     }
 }
 
 impl TextEmbedder for SigLIP2TextEmbedder {
     fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        let ids = self.tokenizer.encode(text, 64);
+        // SigLIP2 was trained on lowercased text
+        let ids = self.tokenizer.encode(&text.to_lowercase(), 64);
         let input = Tensor::i64(vec![1, 64], ids);
-
-        #[cfg(feature = "gpu")]
-        if let Some(ref gpu) = self.gpu {
-            let outputs = gpu.lock().unwrap().run(&self.model, vec![("input_ids", input)])
-                .context("gpu run text model")?;
-            let pooler = outputs.get("pooler_output")
-                .context("missing pooler_output")?;
-            let mut v = pooler.as_f32().to_vec();
-            l2_normalize(&mut v);
-            return Ok(v);
-        }
-
         let outputs = onnx::run(&self.model, vec![("input_ids", input)])
             .context("run text model")?;
         let pooler = outputs.get("pooler_output")
@@ -168,14 +214,14 @@ mod bench {
     #[ignore]
     fn bench_image_embed() {
         let dir = model_dir();
-        let embedder = SigLIP2ImageEmbedder::load(&dir.join("siglip2_image.onnx"))
+        let embedder = SigLIP2ImageEmbedder::load(&dir.join("siglip2_image.onnx"), 224, 1)
             .expect("load image model");
         let img = DynamicImage::from(image::RgbImage::new(224, 224));
         let n = 10;
         let mut times = Vec::with_capacity(n);
         for _ in 0..n {
             let t = Instant::now();
-            embedder.embed(&img).expect("embed");
+            embedder.embed_batch(std::slice::from_ref(&img)).expect("embed");
             times.push(t.elapsed().as_secs_f64() * 1000.0);
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
